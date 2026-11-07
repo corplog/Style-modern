@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Style Modern - Barbería en San Juan de Lurigancho, Lima. Cortes actuales para jóvenes y adultos. Reserva por WhatsApp y paga con Yape.">
+<title>Style Modern | Barbería SJL - Lima</title>
+<style>
+  /* ====== CONFIGURACIÓN GLOBAL ====== */
+  :root{
+    --dorado: #d4af37;
+    --negro: #0d0d0d;
+    --gris: #1a1a1a;
+    --gris-claro: #242424;
+    --texto: #f5f5f5;
+    --whatsapp: #25D366;
+    --yape: #6f2c91;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif;}
+  html{scroll-behavior:smooth;}
+  body{
+    background:var(--negro);
+    color:var(--texto);
+    overflow-x:hidden;
+    min-height:100vh;
+  }
+
+  /* ====== FONDO ANIMADO BARBERÍA ====== */
+  .fondo-animado{
+    position:fixed;
+    top:0;left:0;
+    width:100%;height:100%;
+    z-index:-2;
+    background:
+      radial-gradient(circle at 20% 30%, rgba(212,175,55,.12), transparent 40%),
+      radial-gradient(circle at 80% 70%, rgba(212,175,55,.10), transparent 40%),
+      linear-gradient(180deg,#0d0d0d 0%,#141414 50%,#0d0d0d 100%);
+  }
+  .poste{
+    position:fixed;
+    top:0;left:0;
+    width:100%;height:100%;
+    z-index:-1;
+    opacity:.06;
+    background-image:repeating-linear-gradient(
+      -45deg,
+      #d4af37 0 40px,
+      transparent 40px 80px,
+      #b01010 80px 120px,
+      transparent 120px 160px
+    );
+    animation:girar 12s linear infinite;
+  }
+  @keyframes girar{
+    from{background-position:0 0;}
+    to{background-position:400px 400px;}
+  }
+  .flotantes{
+    position:fixed;
+    inset:0;
+    z-index:-1;
+    pointer-events:none;
+    overflow:hidden;
+    font-size:2.2rem;
+    opacity:.08;
+  }
+  .flotantes span{
+    position:absolute;
+    animation:flotar 18s linear infinite;
+  }
+  .flotantes span:nth-child(1){left:5%;animation-delay:0s;}
+  .flotantes span:nth-child(2){left:25%;animation-delay:3s;}
+  .flotantes span:nth-child(3){left:50%;animation-delay:6s;}
+  .flotantes span:nth-child(4){left:72%;animation-delay:2s;}
+  .flotantes span:nth-child(5){left:90%;animation-delay:8s;}
+  @keyframes flotar{
+    0%{transform:translateY(110vh) rotate(0deg);}
+    100%{transform:translateY(-20vh) rotate(360deg);}
+  }
+
+  /* ====== HEADER / NAV ====== */
+  header{
+    position:sticky;top:0;z-index:100;
+    background:rgba(13,13,13,.92);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid rgba(212,175,55,.3);
+    padding:12px 20px;
+    display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;
+    gap:10px;
+  }
+  .logo{
+    display:flex;align-items:center;gap:10px;
+    font-weight:800;font-size:1.4rem;
+    letter-spacing:1px;
+  }
+  .logo .icono{
+    font-size:1.8rem;
+    filter:drop-shadow(0 0 6px var(--dorado));
+    animation:brillo 3s ease-in-out infinite;
+  }
+  @keyframes brillo{
+    0%,100%{filter:drop-shadow(0 0 4px var(--dorado));}
+    50%{filter:drop-shadow(0 0 14px var(--dorado));}
+  }
+  .logo span{color:var(--dorado);}
+  nav a{
+    color:var(--texto);
+    text-decoration:none;
+    margin:0 8px;
+    font-size:.9rem;
+    transition:.3s;
+    padding:6px 4px;
+  }
+  nav a:hover{color:var(--dorado);}
+
+  /* ====== HERO ====== */
+  .hero{
+    text-align:center;
+    padding:80px 20px 60px;
+    max-width:900px;
+    margin:0 auto;
+  }
+  .hero h1{
+    font-size:clamp(2rem,6vw,3.5rem);
+    margin-bottom:15px;
+    text-transform:uppercase;
+    line-height:1.1;
+  }
+  .hero h1 span{color:var(--dorado);}
+  .hero p{
+    color:#bbb;font-size:1.05rem;
+    max-width:600px;margin:0 auto 25px;
+    line-height:1.6;
+  }
+  .btn{
+    display:inline-block;
+    background:var(--dorado);
+    color:var(--negro);
+    font-weight:700;
+    padding:14px 30px;
+    border-radius:50px;
+    text-decoration:none;
+    border:none;
+    cursor:pointer;
+    font-size:1rem;
+    transition:.3s;
+    box-shadow:0 6px 20px rgba(212,175,55,.35);
+    font-family:inherit;
+  }
+  .btn:hover{transform:translateY(-3px);box-shadow:0 10px 28px rgba(212,175,55,.5);}
+  .btn-outline{
+    background:transparent;
+    color:var(--dorado);
+    border:2px solid var(--dorado);
+    box-shadow:none;
+    margin-left:10px;
+  }
+  .btn-outline:hover{background:var(--dorado);color:var(--negro);}
+
+  /* ====== SECCIONES ====== */
+  section{max-width:1100px;margin:0 auto;padding:60px 20px;}
+  .titulo-seccion{
+    text-align:center;
+    font-size:clamp(1.6rem,4vw,2.3rem);
+    margin-bottom:10px;
+  }
+  .titulo-seccion span{color:var(--dorado);}
+  .subtitulo{
+    text-align:center;color:#999;
+    margin-bottom:40px;font-size:.95rem;
+  }
+
+  /* ====== GRID DE CORTES ====== */
+  .grid-cortes{
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+    gap:22px;
+  }
+  .card{
+    background:linear-gradient(160deg,var(--gris),var(--gris-claro));
+    border:1px solid rgba(212,175,55,.25);
+    border-radius:16px;
+    overflow:hidden;
+    transition:.35s;
+    position:relative;
+    display:flex;
+    flex-direction:column;
+  }
+  .card:hover{
+    transform:translateY(-6px);
+    border-color:var(--dorado);
+    box-shadow:0 14px 30px rgba(212,175,55,.25);
+  }
+  .card img{
+    width:100%;height:180px;
+    object-fit:cover;
+    display:block;
+    filter:saturate(1.1);
+  }
+  .card-body{padding:16px 18px 20px;display:flex;flex-direction:column;flex:1;}
+  .card-body h3{
+    font-size:1.15rem;margin-bottom:6px;
+    color:var(--texto);
+  }
+  .card-body .desc{
+    font-size:.82rem;color:#aaa;
+    margin-bottom:14px;line-height:1.4;
+    min-height:36px;
+    flex:1;
+  }
+  .precio{
+    font-size:1.4rem;
+    font-weight:800;
+    color:var(--dorado);
+    margin-bottom:12px;
+  }
+  .precio::before{content:"S/ ";font-size:.9rem;}
+  .card .btn{width:100%;text-align:center;padding:11px;font-size:.9rem;}
+
+  /* ====== PANEL EDITOR DE PRECIOS ====== */
+  .editor{
+    background:rgba(212,175,55,.06);
+    border:1px dashed rgba(212,175,55,.5);
+    border-radius:14px;
+    padding:20px;
+    margin-top:40px;
+  }
+  .editor h3{color:var(--dorado);margin-bottom:12px;font-size:1rem;}
+  .editor p{font-size:.82rem;color:#aaa;margin-bottom:14px;}
+  .editor-fila{
+    display:flex;align-items:center;gap:10px;
+    margin-bottom:10px;flex-wrap:wrap;
+  }
+  .editor-fila label{flex:1;min-width:150px;font-size:.88rem;}
+  .editor-fila input{
+    width:110px;
+    background:#111;
+    border:1px solid rgba(212,175,55,.4);
+    color:var(--dorado);
+    font-weight:700;
+    padding:8px 10px;
+    border-radius:8px;
+    font-size:.95rem;
+  }
+  .editor-fila input:focus{outline:2px solid var(--dorado);}
+  .guardar{
+    background:var(--dorado);color:#000;
+    border:none;padding:10px 22px;border-radius:50px;
+    font-weight:700;cursor:pointer;margin-top:8px;
+    font-size:.9rem;
+    font-family:inherit;
+    transition:.25s;
+  }
+  .guardar:hover{transform:scale(1.05);}
+
+  /* ====== RESERVA ====== */
+  .reserva-box{
+    background:linear-gradient(160deg,var(--gris),var(--gris-claro));
+    border:1px solid rgba(212,175,55,.3);
+    border-radius:20px;
+    padding:30px;
+    max-width:650px;margin:0 auto;
+  }
+  .form-group{margin-bottom:16px;}
+  .form-group label{
+    display:block;font-size:.85rem;
+    margin-bottom:6px;color:var(--dorado);
+    font-weight:600;
+  }
+  .form-group input,
+  .form-group select,
+  .form-group textarea{
+    width:100%;
+    background:#111;
+    border:1px solid rgba(212,175,55,.35);
+    color:var(--texto);
+    padding:12px 14px;
+    border-radius:10px;
+    font-size:.95rem;
+    font-family:inherit;
+  }
+  .form-group input:focus,
+  .form-group select:focus{outline:2px solid var(--dorado);}
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  @media(max-width:520px){.form-grid{grid-template-columns:1fr;}}
+
+  .total-box{
+    background:rgba(212,175,55,.1);
+    border:1px solid rgba(212,175,55,.4);
+    border-radius:10px;
+    padding:14px 18px;
+    margin:18px 0;
+    display:flex;justify-content:space-between;align-items:center;
+    font-weight:700;
+  }
+  .total-box span:last-child{color:var(--dorado);font-size:1.3rem;}
+
+  .metodos-pago{
+    display:flex;gap:12px;margin-top:10px;flex-wrap:wrap;
+  }
+  .metodo{
+    flex:1;min-width:120px;
+    padding:14px;
+    border-radius:12px;
+    border:2px solid #333;
+    background:#111;
+    color:#ccc;
+    cursor:pointer;
+    text-align:center;
+    font-weight:600;font-size:.85rem;
+    transition:.25s;
+    user-select:none;
+  }
+  .metodo.activo{border-color:var(--yape);background:rgba(111,44,145,.2);color:#fff;}
+  .metodo.efectivo{border-color:#555;}
+  .metodo.efectivo.activo{border-color:var(--dorado);background:rgba(212,175,55,.15);}
+
+  /* ====== QR ====== */
+  .qr-box{
+    text-align:center;
+    background:#fff;
+    padding:18px;
+    border-radius:14px;
+    display:inline-block;
+    margin:10px auto;
+    position:relative;
+  }
+  .qr-box .edit-pin{top:6px;right:6px;width:30px;height:30px;font-size:.9rem;}
+  .qr-box img{width:190px;height:190px;display:block;margin:0 auto;}
+  .qr-info{font-size:.8rem;color:#666;margin-top:8px;font-weight:600;}
+
+  /* ====== FOOTER ====== */
+  footer{
+    text-align:center;
+    padding:40px 20px;
+    border-top:1px solid rgba(212,175,55,.2);
+    color:#888;font-size:.85rem;
+    margin-top:40px;
+  }
+  footer strong{color:var(--dorado);}
+  .footer-info{margin-top:12px;line-height:1.8;}
+
+  /* ====== WHATSAPP FLOTANTE ====== */
+  .wa-flotante{
+    position:fixed;
+    bottom:22px;right:22px;
+    width:60px;height:60px;
+    background:var(--whatsapp);
+    border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-size:1.9rem;
+    box-shadow:0 6px 20px rgba(37,211,102,.5);
+    z-index:200;
+    text-decoration:none;
+    animation:pulso 2s infinite;
+  }
+  @keyframes pulso{
+    0%,100%{transform:scale(1);}
+    50%{transform:scale(1.08);}
+  }
+
+  /* ====== TOAST ====== */
+  .toast{
+    position:fixed;
+    bottom:100px;left:50%;
+    transform:translateX(-50%) translateY(20px);
+    background:var(--dorado);
+    color:#000;
+    padding:14px 26px;
+    border-radius:50px;
+    font-weight:700;
+    opacity:0;
+    transition:.4s;
+    z-index:300;
+    pointer-events:none;
+    font-size:.9rem;
+    max-width:90%;
+    text-align:center;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+
+  /* ====== MODO DUEÑO ====== */
+  .logo{cursor:pointer;user-select:none;}
+  .modal-overlay{
+    position:fixed;inset:0;z-index:500;
+    background:rgba(0,0,0,.75);
+    display:none;
+    align-items:center;justify-content:center;
+    padding:20px;
+  }
+  .modal-overlay.show{display:flex;}
+  .modal-box{
+    background:var(--gris);
+    border:1px solid rgba(212,175,55,.4);
+    border-radius:16px;
+    padding:26px;
+    max-width:380px;width:100%;
+    text-align:center;
+  }
+  .modal-box h3{color:var(--dorado);margin-bottom:14px;font-size:1.1rem;}
+  .modal-box input{
+    width:100%;background:#111;border:1px solid rgba(212,175,55,.4);
+    color:var(--texto);padding:12px 14px;border-radius:10px;
+    font-size:1.1rem;text-align:center;letter-spacing:3px;margin-bottom:14px;
+  }
+  .modal-box .fila-btn{display:flex;gap:10px;}
+  .modal-box .fila-btn button{flex:1;}
+  .btn-cancelar{
+    background:transparent;border:1px solid #555;color:#ccc;
+    padding:11px;border-radius:50px;cursor:pointer;font-weight:600;
+    font-family:inherit;font-size:.9rem;
+  }
+  .owner-toolbar{
+    position:sticky;top:0;z-index:150;
+    background:linear-gradient(90deg,#3a2e00,#1a1400);
+    border-bottom:1px solid var(--dorado);
+    padding:10px 16px;
+    display:none;
+    align-items:center;justify-content:center;
+    gap:10px;flex-wrap:wrap;
+    font-size:.85rem;
+  }
+  .owner-toolbar.show{display:flex;}
+  .owner-toolbar span{color:var(--dorado);font-weight:700;}
+  .owner-toolbar button{
+    background:var(--dorado);color:#000;border:none;
+    padding:8px 16px;border-radius:50px;font-weight:700;
+    cursor:pointer;font-size:.8rem;font-family:inherit;
+  }
+  .owner-toolbar button.salir{background:transparent;border:1px solid #888;color:#ddd;}
+  .edit-pin{
+    position:absolute;top:8px;right:8px;
+    width:32px;height:32px;border-radius:50%;
+    background:rgba(212,175,55,.95);color:#000;
+    display:none;align-items:center;justify-content:center;
+    font-size:1rem;cursor:pointer;border:none;z-index:5;
+  }
+  body.modo-dueno .edit-pin{display:flex;}
+  .card{position:relative;}
+  .editor-negocio{display:none;}
+  body.modo-dueno .editor-negocio{display:block;}
+</style>
+</head>
+<body>
+
+<!-- FONDO ANIMADO -->
+<div class="fondo-animado"></div>
+<div class="poste"></div>
+<div class="flotantes">
+  <span>✂️</span><span>💈</span><span>🪒</span><span>💈</span><span>✂️</span>
+</div>
+
+<!-- TOOLBAR MODO DUEÑO -->
+<div class="owner-toolbar" id="ownerToolbar">
+  <span>🔓 Modo Dueño activo</span>
+  <button onclick="copiarCodigoHTML()">📋 Copiar código HTML</button>
+  <button onclick="salirModoDueno()" class="salir">🚪 Salir</button>
+</div>
+
+<!-- MODAL CLAVE -->
+<div class="modal-overlay" id="modalClave">
+  <div class="modal-box">
+    <h3>🔒 Acceso Modo Dueño</h3>
+    <input type="password" id="inputClave" placeholder="Clave de acceso" inputmode="numeric" maxlength="12">
+    <div class="fila-btn">
+      <button class="btn-cancelar" onclick="cerrarModalClave()">Cancelar</button>
+      <button class="guardar" style="flex:1;" onclick="verificarClave()">Ingresar</button>
+    </div>
+  </div>
+</div>
+
+<!-- HEADER -->
+<header>
+  <div class="logo" id="logoToques" onclick="registrarToqueLogo()">
+    <span class="icono">💈</span>
+    STYLE <span>MODERN</span>
+  </div>
+  <nav>
+    <a href="#cortes">Cortes</a>
+    <a href="#reservar">Reservar</a>
+    <a href="#qr">Ubicación</a>
+    <a href="#contacto">Contacto</a>
+  </nav>
+</header>
+
+<!-- HERO -->
+<div class="hero">
+  <h1>Estilo que <span>marca</span> diferencia</h1>
+  <p>Los mejores cortes actuales para jóvenes y adultos en San Juan de Lurigancho. Precios accesibles, atención personalizada y pago con Yape.</p>
+  <a href="#reservar" class="btn">Reservar Cita</a>
+  <a href="#cortes" class="btn btn-outline">Ver Cortes</a>
+</div>
+
+<!-- CATÁLOGO DE CORTES -->
+<section id="cortes">
+  <h2 class="titulo-seccion">Nuestros <span>Cortes</span></h2>
+  <p class="subtitulo">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
+
+  <div class="grid-cortes" id="gridCortes"></div>
+
+  <!-- EDITOR DE PRECIOS -->
+  <div class="editor">
+    <h3>⚙️ Panel de administración · Modificar precios</h3>
+    <p>Cambia los precios y presiona "Guardar cambios". Se actualizan al instante y quedan guardados en tu navegador.</p>
+    <div id="editorFilas"></div>
+    <button class="guardar" onclick="guardarPrecios()">💾 Guardar cambios</button>
+  </div>
+
+  <!-- EDITOR DE DATOS DEL NEGOCIO (SOLO MODO DUEÑO) -->
+  <div class="editor editor-negocio">
+    <h3>🏪 Datos del negocio</h3>
+    <p>Edita la dirección, WhatsApp, Yape y horario. Los QR y textos se actualizan solos.</p>
+    <div class="editor-fila"><label>Número WhatsApp (51...)</label><input type="text" id="cfgWhatsapp"></div>
+    <div class="editor-fila"><label>Número Yape</label><input type="text" id="cfgYape"></div>
+    <div class="editor-fila"><label>Dirección del local</label><input type="text" id="cfgDireccion" style="width:220px;"></div>
+    <div class="editor-fila"><label>Horario de atención</label><input type="text" id="cfgHorario" style="width:220px;"></div>
+    <button class="guardar" onclick="guardarDatosNegocio()">💾 Guardar datos del negocio</button>
+  </div>
+</section>
+
+<!-- RESERVA DE CITA -->
+<section id="reservar">
+  <h2 class="titulo-seccion">Reserva tu <span>Cita</span></h2>
+  <p class="subtitulo">Completa tus datos y envía tu reserva directo al WhatsApp del local</p>
+
+  <div class="reserva-box">
+    <div class="form-group">
+      <label>Nombre completo</label>
+      <input type="text" id="cliente" placeholder="Ej: Juan Pérez">
+    </div>
+
+    <div class="form-group">
+      <label>Servicio / Corte</label>
+      <select id="servicio" onchange="actualizarTotal()"></select>
+    </div>
+
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Fecha</label>
+        <input type="date" id="fecha">
+      </div>
+      <div class="form-group">
+        <label>Hora</label>
+        <select id="hora">
+          <option value="">-- Selecciona --</option>
+          <option>09:00</option><option>10:00</option><option>11:00</option>
+          <option>12:00</option><option>13:00</option><option>14:00</option>
+          <option>15:00</option><option>16:00</option><option>17:00</option>
+          <option>18:00</option><option>19:00</option><option>20:00</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Nota adicional (opcional)</label>
+      <input type="text" id="nota" placeholder="Ej: Corte con degradado bajo">
+    </div>
+
+    <div class="total-box">
+      <span>Total a pagar:</span>
+      <span id="total">S/ 0.00</span>
+    </div>
+
+    <div class="form-group">
+      <label>Método de pago</label>
+      <div class="metodos-pago">
+        <div class="metodo activo" id="btnYape" onclick="seleccionarPago('yape')">💜 Yape</div>
+        <div class="metodo efectivo" id="btnEfectivo" onclick="seleccionarPago('efectivo')">💵 Efectivo</div>
+      </div>
+    </div>
+
+    <div id="panelYape" style="text-align:center;margin-top:18px;">
+      <div class="qr-box">
+        <button class="edit-pin" title="Cambiar foto de Yape" onclick="editarImagenYape()">✏️</button>
+        <img id="imgYape" src="" alt="QR Yape">
+        <div class="qr-info">Escanea con tu app Yape · <strong>Style Modern</strong></div>
+      </div>
+      <p style="font-size:.8rem;color:#aaa;margin-top:8px;">
+        Yape al: <strong style="color:var(--dorado)" id="txtYapeNumero">999 888 777</strong> · Titular: Style Modern
+      </p>
+    </div>
+
+    <button class="btn" style="width:100%;margin-top:22px;" onclick="enviarWhatsApp()">
+      📲 Enviar reserva por WhatsApp
+    </button>
+  </div>
+</section>
+
+<!-- QR DEL LOCAL / UBICACIÓN -->
+<section id="qr">
+  <h2 class="titulo-seccion">Nuestra <span>Ubicación</span></h2>
+  <p class="subtitulo">Escanea el QR para ubicar el local en SJL, Lima</p>
+  <div style="text-align:center;">
+    <div class="qr-box">
+      <button class="edit-pin" title="Cambiar foto de ubicación" onclick="editarImagenLocal()">✏️</button>
+      <img id="imgLocal" src="" alt="QR Ubicación Local">
+      <div class="qr-info">Style Modern · San Juan de Lurigancho</div>
+    </div>
+    <p style="color:#aaa;font-size:.9rem;margin-top:14px;">
+      📍 <span id="txtDireccion">Av. Principal SJL, Lima</span> · 🕐 <span id="txtHorario">Lun a Dom: 9:00 am - 8:00 pm</span>
+    </p>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer id="contacto">
+  <div style="font-size:1.5rem;margin-bottom:10px;">💈 <strong>STYLE MODERN</strong> 💈</div>
+  <div class="footer-info">
+    📍 <span id="footerDireccion">San Juan de Lurigancho · Lima, Perú</span><br>
+    📞 WhatsApp: <strong id="footerWhatsapp">+51 999 888 777</strong><br>
+    🕐 <span id="footerHorario">Lunes a Domingo · 9:00 am - 8:00 pm</span><br>
+    💳 Aceptamos Yape · Efectivo
+  </div>
+  <p style="margin-top:20px;color:#555;font-size:.75rem;">
+    © 2025 Style Modern Barbería · Todos los derechos reservados
+  </p>
+</footer>
+
+<!-- WHATSAPP FLOTANTE -->
+<a class="wa-flotante" id="waFlotante" href="#" target="_blank" title="Escríbenos">💬</a>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- INPUT OCULTO PARA SUBIR FOTOS DESDE EL DISPOSITIVO -->
+<input type="file" id="inputFotoOculto" accept="image/*" style="display:none;">
+
+<!-- DATOS DEL SITIO (se actualizan solos al guardar cambios en Modo Dueño) -->
+<script type="application/json" id="siteData">{"config":{"whatsappDueno":"51999888777","nombreNegocio":"Style Modern","yapeNumero":"999 888 777","direccion":"Av. Principal SJL, Lima","horario":"Lun a Dom: 9:00 am - 8:00 pm","horarioFooter":"Lunes a Domingo · 9:00 am - 8:00 pm","ubicacionTexto":"San Juan de Lurigancho · Lima, Perú","yapeQRImg":null,"localQRImg":null},"cortes":[{"id":1,"nombre":"Fade Clásico","desc":"Degradado limpio y moderno, ideal para todo estilo.","precio":15,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"nombre":"Corte Texturizado","desc":"Textura en la parte superior, muy juvenil y actual.","precio":18,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"nombre":"Mullet Moderno","desc":"Estilo retro-vanguardia, tendencia entre jóvenes.","precio":20,"img":"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80"},{"id":4,"nombre":"Buzz Cut / Rapado","desc":"Corte al ras, rápido y de bajo mantenimiento.","precio":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"nombre":"Pompadour Clásico","desc":"Elegancia para adultos, ideal para oficina.","precio":22,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"nombre":"Corte con Diseño","desc":"Líneas y diseños personalizados, tu estilo único.","precio":25,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":7,"nombre":"Barba + Corte","desc":"Servicio completo: corte moderno + perfilado de barba.","precio":28,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"nombre":"Corte Niños","desc":"Paciencia y estilo para los más pequeños.","precio":12,"img":"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80"}]}</script>
+
+<script>
+/* ==========================================================
+   DATOS DEL SITIO (embebidos en JSON para poder exportarlos
+   tal cual al copiar el código HTML actualizado)
+   ========================================================== */
+const DATA_DEFAULT = {
+  config: {
+    whatsappDueno: "51999888777",
+    nombreNegocio: "Style Modern",
+    yapeNumero: "999 888 777",
+    direccion: "Av. Principal SJL, Lima",
+    horario: "Lun a Dom: 9:00 am - 8:00 pm",
+    horarioFooter: "Lunes a Domingo · 9:00 am - 8:00 pm",
+    ubicacionTexto: "San Juan de Lurigancho · Lima, Perú",
+    yapeQRImg: null,
+    localQRImg: null
+  },
+  cortes: [
+    { id:1, nombre:"Fade Clásico", desc:"Degradado limpio y moderno, ideal para todo estilo.", precio:15,
+      img:"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80" },
+    { id:2, nombre:"Corte Texturizado", desc:"Textura en la parte superior, muy juvenil y actual.", precio:18,
+      img:"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80" },
+    { id:3, nombre:"Mullet Moderno", desc:"Estilo retro-vanguardia, tendencia entre jóvenes.", precio:20,
+      img:"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80" },
+    { id:4, nombre:"Buzz Cut / Rapado", desc:"Corte al ras, rápido y de bajo mantenimiento.", precio:12,
+      img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80" },
+    { id:5, nombre:"Pompadour Clásico", desc:"Elegancia para adultos, ideal para oficina.", precio:22,
+      img:"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80" },
+    { id:6, nombre:"Corte con Diseño", desc:"Líneas y diseños personalizados, tu estilo único.", precio:25,
+      img:"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80" },
+    { id:7, nombre:"Barba + Corte", desc:"Servicio completo: corte moderno + perfilado de barba.", precio:28,
+      img:"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80" },
+    { id:8, nombre:"Corte Niños", desc:"Paciencia y estilo para los más pequeños.", precio:12,
+      img:"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80" }
+  ]
+};
+
+/* El JSON embebido en el <script id="siteData"> es la fuente de
+   verdad que viaja DENTRO del archivo cuando copias el código,
+   así tu web ya sale actualizada en GitHub Pages. */
+const elData = document.getElementById("siteData");
+let siteData;
+try{
+  siteData = JSON.parse(elData.textContent);
+}catch(e){
+  siteData = JSON.parse(JSON.stringify(DATA_DEFAULT));
+}
+
+/* Si hay cambios guardados en este navegador (modo dueño sin
+   copiar el código todavía), se aplican encima */
+const guardadoLocal = JSON.parse(localStorage.getItem("styleModernData") || "null");
+if(guardadoLocal){ siteData = guardadoLocal; }
+
+let cortes = siteData.cortes;
+let CONFIG = siteData.config;
+let metodoPago = "yape";
+let ownerMode = false;
+let toquesLogo = 0;
+let toquesTimer = null;
+
+const CLAVE_DUENO = "29101991";
+
+function persistirSiteData(){
+  siteData.cortes = cortes;
+  siteData.config = CONFIG;
+  elData.textContent = JSON.stringify(siteData);
+  localStorage.setItem("styleModernData", JSON.stringify(siteData));
+}
+
+/* ==========================================================
+   RENDERIZADO DE CORTES
+   ========================================================== */
+function renderCortes(){
+  const grid = document.getElementById("gridCortes");
+  grid.innerHTML = cortes.map(c => `
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(${c.id})">✏️</button>
+      <img src="${c.img}" alt="${c.nombre}" loading="lazy">
+      <div class="card-body">
+        <h3>${c.nombre}</h3>
+        <p class="desc">${c.desc}</p>
+        <div class="precio">${c.precio.toFixed(2)}</div>
+        <button class="btn" onclick="reservarCorte(${c.id})">Reservar este corte</button>
+      </div>
+    </div>
+  `).join("");
+}
+
+function editarImagenCorte(id){
+  if(!ownerMode) return;
+  abrirSelectorFoto({tipo:"corte", id});
+}
+
+/* ==========================================================
+   SELECT DE SERVICIO EN FORMULARIO
+   ========================================================== */
+function renderSelect(){
+  const sel = document.getElementById("servicio");
+  sel.innerHTML = '<option value="">-- Selecciona un corte --</option>' +
+    cortes.map(c => `<option value="${c.id}">${c.nombre} — S/ ${c.precio.toFixed(2)}</option>`).join("");
+}
+
+/* ==========================================================
+   EDITOR DE PRECIOS
+   ========================================================== */
+function renderEditor(){
+  const cont = document.getElementById("editorFilas");
+  cont.innerHTML = cortes.map(c => `
+    <div class="editor-fila">
+      <label>${c.nombre}</label>
+      <input type="number" min="1" step="1" id="precio-${c.id}" value="${c.precio}">
+    </div>
+  `).join("");
+}
+
+function guardarPrecios(){
+  cortes = cortes.map(c => {
+    const input = document.getElementById("precio-" + c.id);
+    const nuevo = parseFloat(input.value);
+    return { ...c, precio: isNaN(nuevo) || nuevo <= 0 ? c.precio : nuevo };
+  });
+  persistirSiteData();
+  renderCortes();
+  renderSelect();
+  renderEditor();
+  actualizarTotal();
+  mostrarToast("✅ Precios actualizados correctamente");
+}
+
+/* ==========================================================
+   MODO DUEÑO — activación por 3 toques en el logo + clave
+   ========================================================== */
+function registrarToqueLogo(){
+  if(ownerMode) return;
+  toquesLogo++;
+  clearTimeout(toquesTimer);
+  toquesTimer = setTimeout(() => { toquesLogo = 0; }, 1200);
+  if(toquesLogo >= 3){
+    toquesLogo = 0;
+    abrirModalClave();
+  }
+}
+
+function abrirModalClave(){
+  const modal = document.getElementById("modalClave");
+  const input = document.getElementById("inputClave");
+  input.value = "";
+  modal.classList.add("show");
+  setTimeout(() => input.focus(), 100);
+}
+
+function cerrarModalClave(){
+  document.getElementById("modalClave").classList.remove("show");
+}
+
+function verificarClave(){
+  const valor = document.getElementById("inputClave").value.trim();
+  if(valor === CLAVE_DUENO){
+    cerrarModalClave();
+    activarModoDueno();
+  } else {
+    mostrarToast("❌ Clave incorrecta");
+  }
+}
+
+function activarModoDueno(){
+  ownerMode = true;
+  document.body.classList.add("modo-dueno");
+  document.getElementById("ownerToolbar").classList.add("show");
+  renderCortes();
+  cargarDatosNegocioEnEditor();
+  mostrarToast("🔓 Modo Dueño activado");
+}
+
+function salirModoDueno(){
+  ownerMode = false;
+  document.body.classList.remove("modo-dueno");
+  document.getElementById("ownerToolbar").classList.remove("show");
+  renderCortes();
+  mostrarToast("🔒 Modo Dueño desactivado");
+}
+
+function cargarDatosNegocioEnEditor(){
+  document.getElementById("cfgWhatsapp").value = CONFIG.whatsappDueno;
+  document.getElementById("cfgYape").value = CONFIG.yapeNumero;
+  document.getElementById("cfgDireccion").value = CONFIG.direccion;
+  document.getElementById("cfgHorario").value = CONFIG.horario;
+}
+
+function guardarDatosNegocio(){
+  CONFIG.whatsappDueno = document.getElementById("cfgWhatsapp").value.trim() || CONFIG.whatsappDueno;
+  CONFIG.yapeNumero = document.getElementById("cfgYape").value.trim() || CONFIG.yapeNumero;
+  CONFIG.direccion = document.getElementById("cfgDireccion").value.trim() || CONFIG.direccion;
+  CONFIG.horario = document.getElementById("cfgHorario").value.trim() || CONFIG.horario;
+  CONFIG.horarioFooter = CONFIG.horario;
+  persistirSiteData();
+  aplicarTextosNegocio();
+  regenerarQRs();
+  mostrarToast("✅ Datos del negocio actualizados");
+}
+
+function aplicarTextosNegocio(){
+  document.getElementById("txtDireccion").textContent = CONFIG.direccion;
+  document.getElementById("txtHorario").textContent = CONFIG.horario;
+  document.getElementById("footerDireccion").textContent = CONFIG.ubicacionTexto;
+  document.getElementById("footerWhatsapp").textContent = "+" + CONFIG.whatsappDueno;
+  document.getElementById("footerHorario").textContent = CONFIG.horarioFooter;
+  document.getElementById("txtYapeNumero").textContent = CONFIG.yapeNumero;
+}
+
+function regenerarQRs(){
+  if(CONFIG.yapeQRImg){
+    document.getElementById("imgYape").src = CONFIG.yapeQRImg;
+  } else {
+    const dataYape = "YAPE-" + CONFIG.nombreNegocio.toUpperCase().replace(/\s+/g,"-") + "-" + CONFIG.yapeNumero.replace(/\s+/g,"");
+    document.getElementById("imgYape").src = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + encodeURIComponent(dataYape);
+  }
+  if(CONFIG.localQRImg){
+    document.getElementById("imgLocal").src = CONFIG.localQRImg;
+  } else {
+    const dataLocal = "https://maps.google.com/?q=" + encodeURIComponent(CONFIG.direccion + " " + CONFIG.ubicacionTexto);
+    document.getElementById("imgLocal").src = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + dataLocal;
+  }
+  document.getElementById("waFlotante").href =
+    `https://wa.me/${CONFIG.whatsappDueno}?text=${encodeURIComponent("Hola, quiero información sobre los cortes 💈")}`;
+}
+
+function editarImagenYape(){
+  if(!ownerMode) return;
+  if(CONFIG.yapeQRImg && confirm("Ya tienes una foto de Yape personalizada.\n\nAceptar = subir otra foto nueva\nCancelar = volver al QR automático")){
+    abrirSelectorFoto({tipo:"yape"});
+  } else if(CONFIG.yapeQRImg){
+    CONFIG.yapeQRImg = null;
+    persistirSiteData();
+    regenerarQRs();
+    mostrarToast("✅ Volviendo al QR automático de Yape");
+  } else {
+    abrirSelectorFoto({tipo:"yape"});
+  }
+}
+
+function editarImagenLocal(){
+  if(!ownerMode) return;
+  if(CONFIG.localQRImg && confirm("Ya tienes una foto de ubicación personalizada.\n\nAceptar = subir otra foto nueva\nCancelar = volver al QR automático")){
+    abrirSelectorFoto({tipo:"local"});
+  } else if(CONFIG.localQRImg){
+    CONFIG.localQRImg = null;
+    persistirSiteData();
+    regenerarQRs();
+    mostrarToast("✅ Volviendo al QR automático de ubicación");
+  } else {
+    abrirSelectorFoto({tipo:"local"});
+  }
+}
+
+/* ==========================================================
+   SUBIR FOTOS DESDE EL DISPOSITIVO (galería/cámara)
+   ========================================================== */
+let objetivoFoto = null;
+
+function abrirSelectorFoto(objetivo){
+  objetivoFoto = objetivo;
+  const input = document.getElementById("inputFotoOculto");
+  input.value = "";
+  input.click();
+}
+
+document.getElementById("inputFotoOculto").addEventListener("change", function(e){
+  const file = e.target.files && e.target.files[0];
+  if(!file || !objetivoFoto) return;
+  if(!file.type.startsWith("image/")){
+    mostrarToast("⚠️ Elige un archivo de imagen");
+    return;
+  }
+  mostrarToast("⏳ Procesando foto...");
+  const maxAncho = objetivoFoto.tipo === "corte" ? 700 : 450;
+  redimensionarImagen(file, maxAncho, (dataUrl) => {
+    if(objetivoFoto.tipo === "corte"){
+      const corte = cortes.find(c => c.id === objetivoFoto.id);
+      if(corte){ corte.img = dataUrl; renderCortes(); }
+    } else if(objetivoFoto.tipo === "yape"){
+      CONFIG.yapeQRImg = dataUrl;
+      regenerarQRs();
+    } else if(objetivoFoto.tipo === "local"){
+      CONFIG.localQRImg = dataUrl;
+      regenerarQRs();
+    }
+    persistirSiteData();
+    mostrarToast("✅ Foto actualizada");
+    objetivoFoto = null;
+  });
+});
+
+function redimensionarImagen(file, maxAncho, callback){
+  const lector = new FileReader();
+  lector.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      let w = img.width, h = img.height;
+      if(w > maxAncho){
+        h = Math.round(h * (maxAncho / w));
+        w = maxAncho;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      callback(canvas.toDataURL("image/jpeg", 0.82));
+    };
+    img.onerror = () => {
+      mostrarToast("⚠️ No se pudo leer esa imagen");
+    };
+    img.src = e.target.result;
+  };
+  lector.onerror = () => mostrarToast("⚠️ No se pudo leer el archivo");
+  lector.readAsDataURL(file);
+}
+
+/* ==========================================================
+   COPIAR CÓDIGO HTML ACTUALIZADO (para GitHub Pages)
+   ========================================================== */
+function copiarCodigoHTML(){
+  persistirSiteData();
+  const codigo = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(codigo).then(() => {
+      mostrarToast("📋 Código copiado — pégalo en tu index.html de GitHub");
+    }).catch(() => copiarConTextarea(codigo));
+  } else {
+    copiarConTextarea(codigo);
+  }
+}
+
+function copiarConTextarea(texto){
+  const ta = document.createElement("textarea");
+  ta.value = texto;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try{
+    document.execCommand("copy");
+    mostrarToast("📋 Código copiado — pégalo en tu index.html de GitHub");
+  }catch(e){
+    mostrarToast("⚠️ No se pudo copiar automáticamente, selecciona y copia manualmente");
+  }
+  document.body.removeChild(ta);
+}
+
+/* ==========================================================
+   RESERVA
+   ========================================================== */
+function reservarCorte(id){
+  document.getElementById("servicio").value = id;
+  actualizarTotal();
+  document.getElementById("reservar").scrollIntoView({behavior:"smooth"});
+}
+
+function actualizarTotal(){
+  const id = document.getElementById("servicio").value;
+  const corte = cortes.find(c => c.id == id);
+  const totalEl = document.getElementById("total");
+  totalEl.textContent = corte ? "S/ " + corte.precio.toFixed(2) : "S/ 0.00";
+}
+
+/* Selección de método de pago */
+function seleccionarPago(metodo){
+  metodoPago = metodo;
+  document.getElementById("btnYape").classList.toggle("activo", metodo === "yape");
+  document.getElementById("btnEfectivo").classList.toggle("activo", metodo === "efectivo");
+  document.getElementById("panelYape").style.display = metodo === "yape" ? "block" : "none";
+}
+
+/* ==========================================================
+   ENVIAR RESERVA A WHATSAPP
+   ========================================================== */
+function enviarWhatsApp(){
+  const cliente = document.getElementById("cliente").value.trim();
+  const idServ = document.getElementById("servicio").value;
+  const fecha = document.getElementById("fecha").value;
+  const hora = document.getElementById("hora").value;
+  const nota = document.getElementById("nota").value.trim();
+
+  if(!cliente || !idServ || !fecha || !hora){
+    mostrarToast("⚠️ Completa todos los campos obligatorios");
+    return;
+  }
+
+  const corte = cortes.find(c => c.id == idServ);
+  const metodoTexto = metodoPago === "yape" ? "Yape 💜" : "Efectivo 💵";
+
+  const f = new Date(fecha + "T00:00:00");
+  const fechaBonita = f.toLocaleDateString("es-PE", {
+    weekday:"long", day:"numeric", month:"long", year:"numeric"
+  });
+
+  const mensaje =
+`💈 *NUEVA RESERVA - ${CONFIG.nombreNegocio}* 💈
+━━━━━━━━━━━━━━━━━━━━
+👤 *Cliente:* ${cliente}
+✂️ *Servicio:* ${corte.nombre}
+💰 *Precio:* S/ ${corte.precio.toFixed(2)}
+📅 *Fecha:* ${fechaBonita}
+🕐 *Hora:* ${hora}
+💳 *Pago:* ${metodoTexto}
+${nota ? "📝 *Nota:* " + nota : ""}
+━━━━━━━━━━━━━━━━━━━━
+_Reserva enviada desde la web_`;
+
+  const url = `https://wa.me/${CONFIG.whatsappDueno}?text=${encodeURIComponent(mensaje)}`;
+  window.open(url, "_blank");
+  mostrarToast("📲 Abriendo WhatsApp...");
+}
+
+/* ==========================================================
+   TOAST
+   ========================================================== */
+function mostrarToast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2800);
+}
+
+/* ==========================================================
+   INICIALIZACIÓN
+   ========================================================== */
+document.addEventListener("DOMContentLoaded", () => {
+  renderCortes();
+  renderSelect();
+  renderEditor();
+  aplicarTextosNegocio();
+  regenerarQRs();
+
+  const hoy = new Date().toISOString().split("T")[0];
+  document.getElementById("fecha").min = hoy;
+
+  actualizarTotal();
+});
+</script>
+</body>
+</html>
