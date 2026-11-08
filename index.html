@@ -1,6 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
-<head>
+<html lang="es"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="description" content="Style Modern - Barbería en San Juan de Lurigancho, Lima. Cortes actuales para jóvenes y adultos. Reserva por WhatsApp y paga con Yape.">
@@ -442,7 +441,7 @@
   body.modo-dueno .editor-negocio{display:block;}
 </style>
 </head>
-<body>
+<body class="modo-dueno">
 
 <!-- FONDO ANIMADO -->
 <div class="fondo-animado"></div>
@@ -452,7 +451,7 @@
 </div>
 
 <!-- TOOLBAR MODO DUEÑO -->
-<div class="owner-toolbar" id="ownerToolbar">
+<div class="owner-toolbar show" id="ownerToolbar">
   <span>🔓 Modo Dueño activo</span>
   <button onclick="copiarCodigoHTML()">📋 Copiar código HTML</button>
   <button onclick="salirModoDueno()" class="salir">🚪 Salir</button>
@@ -497,13 +496,141 @@
   <h2 class="titulo-seccion">Nuestros <span>Cortes</span></h2>
   <p class="subtitulo">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
 
-  <div class="grid-cortes" id="gridCortes"></div>
+  <div class="grid-cortes" id="gridCortes">
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(1)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&amp;q=80" alt="Fade Clásico" loading="lazy">
+      <div class="card-body">
+        <h3>Fade Clásico</h3>
+        <p class="desc">Degradado limpio y moderno, ideal para todo estilo.</p>
+        <div class="precio">30.00</div>
+        <button class="btn" onclick="reservarCorte(1)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(2)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&amp;q=80" alt="Corte Texturizado" loading="lazy">
+      <div class="card-body">
+        <h3>Corte Texturizado</h3>
+        <p class="desc">Textura en la parte superior, muy juvenil y actual.</p>
+        <div class="precio">50.00</div>
+        <button class="btn" onclick="reservarCorte(2)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(3)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&amp;q=80" alt="Mullet Moderno" loading="lazy">
+      <div class="card-body">
+        <h3>Mullet Moderno</h3>
+        <p class="desc">Estilo retro-vanguardia, tendencia entre jóvenes.</p>
+        <div class="precio">62.00</div>
+        <button class="btn" onclick="reservarCorte(3)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(4)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&amp;q=80" alt="Buzz Cut / Rapado" loading="lazy">
+      <div class="card-body">
+        <h3>Buzz Cut / Rapado</h3>
+        <p class="desc">Corte al ras, rápido y de bajo mantenimiento.</p>
+        <div class="precio">13.00</div>
+        <button class="btn" onclick="reservarCorte(4)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(5)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&amp;q=80" alt="Pompadour Clásico" loading="lazy">
+      <div class="card-body">
+        <h3>Pompadour Clásico</h3>
+        <p class="desc">Elegancia para adultos, ideal para oficina.</p>
+        <div class="precio">29.00</div>
+        <button class="btn" onclick="reservarCorte(5)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(6)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Corte con Diseño" loading="lazy">
+      <div class="card-body">
+        <h3>Corte con Diseño</h3>
+        <p class="desc">Líneas y diseños personalizados, tu estilo único.</p>
+        <div class="precio">232.00</div>
+        <button class="btn" onclick="reservarCorte(6)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(7)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&amp;q=80" alt="Barba + Corte" loading="lazy">
+      <div class="card-body">
+        <h3>Barba + Corte</h3>
+        <p class="desc">Servicio completo: corte moderno + perfilado de barba.</p>
+        <div class="precio">2812.00</div>
+        <button class="btn" onclick="reservarCorte(7)">Reservar este corte</button>
+      </div>
+    </div>
+  
+    <div class="card">
+      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(8)">✏️</button>
+      <img src="https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&amp;q=80" alt="Corte Niños" loading="lazy">
+      <div class="card-body">
+        <h3>Corte Niños</h3>
+        <p class="desc">Paciencia y estilo para los más pequeños.</p>
+        <div class="precio">1212.00</div>
+        <button class="btn" onclick="reservarCorte(8)">Reservar este corte</button>
+      </div>
+    </div>
+  </div>
 
   <!-- EDITOR DE PRECIOS -->
   <div class="editor">
     <h3>⚙️ Panel de administración · Modificar precios</h3>
     <p>Cambia los precios y presiona "Guardar cambios". Se actualizan al instante y quedan guardados en tu navegador.</p>
-    <div id="editorFilas"></div>
+    <div id="editorFilas">
+    <div class="editor-fila">
+      <label>Fade Clásico</label>
+      <input type="number" min="1" step="1" id="precio-1" value="30">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Corte Texturizado</label>
+      <input type="number" min="1" step="1" id="precio-2" value="50">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Mullet Moderno</label>
+      <input type="number" min="1" step="1" id="precio-3" value="62">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Buzz Cut / Rapado</label>
+      <input type="number" min="1" step="1" id="precio-4" value="13">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Pompadour Clásico</label>
+      <input type="number" min="1" step="1" id="precio-5" value="29">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Corte con Diseño</label>
+      <input type="number" min="1" step="1" id="precio-6" value="232">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Barba + Corte</label>
+      <input type="number" min="1" step="1" id="precio-7" value="2812">
+    </div>
+  
+    <div class="editor-fila">
+      <label>Corte Niños</label>
+      <input type="number" min="1" step="1" id="precio-8" value="1212">
+    </div>
+  </div>
     <button class="guardar" onclick="guardarPrecios()">💾 Guardar cambios</button>
   </div>
 
@@ -532,13 +659,13 @@
 
     <div class="form-group">
       <label>Servicio / Corte</label>
-      <select id="servicio" onchange="actualizarTotal()"></select>
+      <select id="servicio" onchange="actualizarTotal()"><option value="">-- Selecciona un corte --</option><option value="1">Fade Clásico — S/ 30.00</option><option value="2">Corte Texturizado — S/ 50.00</option><option value="3">Mullet Moderno — S/ 62.00</option><option value="4">Buzz Cut / Rapado — S/ 13.00</option><option value="5">Pompadour Clásico — S/ 29.00</option><option value="6">Corte con Diseño — S/ 232.00</option><option value="7">Barba + Corte — S/ 2812.00</option><option value="8">Corte Niños — S/ 1212.00</option></select>
     </div>
 
     <div class="form-grid">
       <div class="form-group">
         <label>Fecha</label>
-        <input type="date" id="fecha">
+        <input type="date" id="fecha" min="2026-11-08">
       </div>
       <div class="form-group">
         <label>Hora</label>
@@ -573,7 +700,7 @@
     <div id="panelYape" style="text-align:center;margin-top:18px;">
       <div class="qr-box">
         <button class="edit-pin" title="Cambiar foto de Yape" onclick="editarImagenYape()">✏️</button>
-        <img id="imgYape" src="" alt="QR Yape">
+        <img id="imgYape" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=YAPE-STYLE-MODERN-999888777" alt="QR Yape">
         <div class="qr-info">Escanea con tu app Yape · <strong>Style Modern</strong></div>
       </div>
       <p style="font-size:.8rem;color:#aaa;margin-top:8px;">
@@ -594,7 +721,7 @@
   <div style="text-align:center;">
     <div class="qr-box">
       <button class="edit-pin" title="Cambiar foto de ubicación" onclick="editarImagenLocal()">✏️</button>
-      <img id="imgLocal" src="" alt="QR Ubicación Local">
+      <img id="imgLocal" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https://maps.google.com/?q=Av.%20Principal%20SJL%2C%20Lima%20San%20Juan%20de%20Lurigancho%20%C2%B7%20Lima%2C%20Per%C3%BA" alt="QR Ubicación Local">
       <div class="qr-info">Style Modern · San Juan de Lurigancho</div>
     </div>
     <p style="color:#aaa;font-size:.9rem;margin-top:14px;">
@@ -608,7 +735,7 @@
   <div style="font-size:1.5rem;margin-bottom:10px;">💈 <strong>STYLE MODERN</strong> 💈</div>
   <div class="footer-info">
     📍 <span id="footerDireccion">San Juan de Lurigancho · Lima, Perú</span><br>
-    📞 WhatsApp: <strong id="footerWhatsapp">+51 999 888 777</strong><br>
+    📞 WhatsApp: <strong id="footerWhatsapp">+51999888777</strong><br>
     🕐 <span id="footerHorario">Lunes a Domingo · 9:00 am - 8:00 pm</span><br>
     💳 Aceptamos Yape · Efectivo
   </div>
@@ -618,16 +745,16 @@
 </footer>
 
 <!-- WHATSAPP FLOTANTE -->
-<a class="wa-flotante" id="waFlotante" href="#" target="_blank" title="Escríbenos">💬</a>
+<a class="wa-flotante" id="waFlotante" href="https://wa.me/51999888777?text=Hola%2C%20quiero%20informaci%C3%B3n%20sobre%20los%20cortes%20%F0%9F%92%88" target="_blank" title="Escríbenos">💬</a>
 
 <!-- TOAST -->
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast">✅ Precios actualizados correctamente</div>
 
 <!-- INPUT OCULTO PARA SUBIR FOTOS DESDE EL DISPOSITIVO -->
 <input type="file" id="inputFotoOculto" accept="image/*" style="display:none;">
 
 <!-- DATOS DEL SITIO (se actualizan solos al guardar cambios en Modo Dueño) -->
-<script type="application/json" id="siteData">{"config":{"whatsappDueno":"51999888777","nombreNegocio":"Style Modern","yapeNumero":"999 888 777","direccion":"Av. Principal SJL, Lima","horario":"Lun a Dom: 9:00 am - 8:00 pm","horarioFooter":"Lunes a Domingo · 9:00 am - 8:00 pm","ubicacionTexto":"San Juan de Lurigancho · Lima, Perú","yapeQRImg":null,"localQRImg":null},"cortes":[{"id":1,"nombre":"Fade Clásico","desc":"Degradado limpio y moderno, ideal para todo estilo.","precio":15,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"nombre":"Corte Texturizado","desc":"Textura en la parte superior, muy juvenil y actual.","precio":18,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"nombre":"Mullet Moderno","desc":"Estilo retro-vanguardia, tendencia entre jóvenes.","precio":20,"img":"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80"},{"id":4,"nombre":"Buzz Cut / Rapado","desc":"Corte al ras, rápido y de bajo mantenimiento.","precio":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"nombre":"Pompadour Clásico","desc":"Elegancia para adultos, ideal para oficina.","precio":22,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"nombre":"Corte con Diseño","desc":"Líneas y diseños personalizados, tu estilo único.","precio":25,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":7,"nombre":"Barba + Corte","desc":"Servicio completo: corte moderno + perfilado de barba.","precio":28,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"nombre":"Corte Niños","desc":"Paciencia y estilo para los más pequeños.","precio":12,"img":"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80"}]}</script>
+<script type="application/json" id="siteData">{"config":{"whatsappDueno":"51999888777","nombreNegocio":"Style Modern","yapeNumero":"999 888 777","direccion":"Av. Principal SJL, Lima","horario":"Lun a Dom: 9:00 am - 8:00 pm","horarioFooter":"Lunes a Domingo · 9:00 am - 8:00 pm","ubicacionTexto":"San Juan de Lurigancho · Lima, Perú","yapeQRImg":null,"localQRImg":null},"cortes":[{"id":1,"nombre":"Fade Clásico","desc":"Degradado limpio y moderno, ideal para todo estilo.","precio":30,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"nombre":"Corte Texturizado","desc":"Textura en la parte superior, muy juvenil y actual.","precio":50,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"nombre":"Mullet Moderno","desc":"Estilo retro-vanguardia, tendencia entre jóvenes.","precio":62,"img":"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80"},{"id":4,"nombre":"Buzz Cut / Rapado","desc":"Corte al ras, rápido y de bajo mantenimiento.","precio":13,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"nombre":"Pompadour Clásico","desc":"Elegancia para adultos, ideal para oficina.","precio":29,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"nombre":"Corte con Diseño","desc":"Líneas y diseños personalizados, tu estilo único.","precio":232,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":7,"nombre":"Barba + Corte","desc":"Servicio completo: corte moderno + perfilado de barba.","precio":2812,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"nombre":"Corte Niños","desc":"Paciencia y estilo para los más pequeños.","precio":1212,"img":"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80"}]}</script>
 
 <script>
 /* ==========================================================
@@ -1069,5 +1196,6 @@ document.addEventListener("DOMContentLoaded", () => {
   actualizarTotal();
 });
 </script>
-</body>
-</html>
+
+
+</body></html>
