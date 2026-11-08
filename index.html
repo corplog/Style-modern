@@ -1,6 +1,551 @@
 <!DOCTYPE html>
-<html lang="es">
-<head>
+<html lang="es"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="description" content="Style Modern - Barbería en San Juan de Lurigancho, Lima.">
@@ -10,8 +555,6 @@
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif;}
 html{scroll-behavior:smooth;}
 body{background:var(--n);color:var(--t);overflow-x:hidden;min-height:100vh;}
-
-/* FONDO */
 .bg{position:fixed;inset:0;z-index:-2;
   background:radial-gradient(circle at 20% 30%,rgba(212,175,55,.12),transparent 40%),
   radial-gradient(circle at 80% 70%,rgba(212,175,55,.10),transparent 40%),
@@ -28,41 +571,30 @@ body{background:var(--n);color:var(--t);overflow-x:hidden;min-height:100vh;}
 .flot span:nth-child(4){left:72%;animation-delay:2s}
 .flot span:nth-child(5){left:90%;animation-delay:8s}
 @keyframes flt{0%{transform:translateY(110vh) rotate(0deg)}100%{transform:translateY(-20vh) rotate(360deg)}}
-
-/* HEADER */
 header{position:sticky;top:0;z-index:100;background:rgba(13,13,13,.93);backdrop-filter:blur(10px);
   border-bottom:1px solid rgba(212,175,55,.3);padding:12px 20px;
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
 .logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.4rem;letter-spacing:1px;
   cursor:pointer;user-select:none;}
-.logo em{font-style:normal;font-size:1.8rem;
-  filter:drop-shadow(0 0 6px var(--d));animation:bri 3s ease-in-out infinite;}
+.logo em{font-style:normal;font-size:1.8rem;filter:drop-shadow(0 0 6px var(--d));animation:bri 3s ease-in-out infinite;}
 @keyframes bri{0%,100%{filter:drop-shadow(0 0 4px var(--d))}50%{filter:drop-shadow(0 0 14px var(--d))}}
 .logo b{color:var(--d);}
 nav a{color:var(--t);text-decoration:none;margin:0 8px;font-size:.9rem;transition:.3s;}
 nav a:hover{color:var(--d);}
-
-/* HERO */
 .hero{text-align:center;padding:80px 20px 60px;max-width:900px;margin:0 auto;}
 .hero h1{font-size:clamp(2rem,6vw,3.5rem);margin-bottom:14px;text-transform:uppercase;line-height:1.1;}
 .hero h1 b{color:var(--d);}
 .hero p{color:#bbb;font-size:1.05rem;max-width:600px;margin:0 auto 24px;line-height:1.6;}
-
-/* BOTONES */
 .btn{display:inline-block;background:var(--d);color:var(--n);font-weight:700;padding:13px 28px;
   border-radius:50px;text-decoration:none;border:none;cursor:pointer;font-size:1rem;
   transition:.3s;box-shadow:0 6px 20px rgba(212,175,55,.35);font-family:inherit;}
 .btn:hover{transform:translateY(-3px);box-shadow:0 10px 28px rgba(212,175,55,.5);}
 .btn-o{background:transparent;color:var(--d);border:2px solid var(--d);box-shadow:none;margin-left:10px;}
 .btn-o:hover{background:var(--d);color:var(--n);}
-
-/* SECCIONES */
 section{max-width:1100px;margin:0 auto;padding:60px 20px;}
 .sec-t{text-align:center;font-size:clamp(1.6rem,4vw,2.3rem);margin-bottom:8px;}
 .sec-t b{color:var(--d);}
 .sec-s{text-align:center;color:#999;margin-bottom:38px;font-size:.95rem;}
-
-/* GRID CORTES */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:22px;}
 .card{background:linear-gradient(160deg,var(--g),var(--gc));border:1px solid rgba(212,175,55,.25);
   border-radius:16px;overflow:hidden;transition:.35s;position:relative;display:flex;flex-direction:column;}
@@ -74,15 +606,10 @@ section{max-width:1100px;margin:0 auto;padding:60px 20px;}
 .precio{font-size:1.4rem;font-weight:800;color:var(--d);margin-bottom:12px;}
 .precio::before{content:"S/ ";font-size:.9rem;}
 .card .btn{width:100%;text-align:center;padding:11px;font-size:.88rem;}
-
-/* LÁPIZ editar (solo visible en modo dueño) */
 .pin{position:absolute;top:8px;right:8px;width:34px;height:34px;border-radius:50%;
   background:var(--d);color:#000;border:none;cursor:pointer;font-size:1rem;
-  display:none;align-items:center;justify-content:center;z-index:10;
-  box-shadow:0 2px 8px rgba(0,0,0,.5);}
+  display:none;align-items:center;justify-content:center;z-index:10;box-shadow:0 2px 8px rgba(0,0,0,.5);}
 body.md .pin{display:flex;}
-
-/* RESERVA */
 .rbox{background:linear-gradient(160deg,var(--g),var(--gc));border:1px solid rgba(212,175,55,.3);
   border-radius:20px;padding:28px;max-width:650px;margin:0 auto;}
 .fg{margin-bottom:14px;}
@@ -101,84 +628,65 @@ body.md .pin{display:flex;}
 .mp.activo{border-color:var(--yp);background:rgba(111,44,145,.2);color:#fff;}
 .mp.ef{border-color:#555;}
 .mp.ef.activo{border-color:var(--d);background:rgba(212,175,55,.15);}
-
-/* QR */
 .qr-wrap{text-align:center;}
-.qr-box{background:#fff;padding:16px;border-radius:14px;display:inline-block;
-  margin:10px auto;position:relative;}
+.qr-box{background:#fff;padding:16px;border-radius:14px;display:inline-block;margin:10px auto;position:relative;}
 .qr-box img{width:190px;height:190px;display:block;margin:0 auto;object-fit:contain;}
 .qr-box .pin{top:6px;right:6px;width:30px;height:30px;font-size:.85rem;}
 .qr-info{font-size:.78rem;color:#555;margin-top:7px;font-weight:600;}
-
-/* FOOTER */
 footer{text-align:center;padding:38px 20px;border-top:1px solid rgba(212,175,55,.2);color:#888;font-size:.85rem;}
 footer b{color:var(--d);}
 .foot-info{margin-top:11px;line-height:1.9;}
-
-/* WA FLOTANTE */
 .wa{position:fixed;bottom:22px;right:22px;width:60px;height:60px;background:var(--wa);
   border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.9rem;
   box-shadow:0 6px 20px rgba(37,211,102,.5);z-index:200;text-decoration:none;animation:puls 2s infinite;}
 @keyframes puls{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
-
-/* TOAST */
 .toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%) translateY(20px);
   background:var(--d);color:#000;padding:13px 24px;border-radius:50px;font-weight:700;
   opacity:0;transition:.4s;z-index:9999;pointer-events:none;font-size:.88rem;max-width:92%;text-align:center;}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
-
-/* ===== MODO DUEÑO ===== */
-/* TOOLBAR */
-.ot{position:sticky;top:0;z-index:500;
-  background:linear-gradient(90deg,#3a2200,#1a1000);
-  border-bottom:2px solid var(--d);
-  padding:10px 14px;display:none;flex-wrap:wrap;gap:8px;align-items:center;}
+/* MODO DUEÑO */
+.ot{position:sticky;top:0;z-index:500;background:linear-gradient(90deg,#3a2200,#1a1000);
+  border-bottom:2px solid var(--d);padding:10px 14px;display:none;flex-wrap:wrap;gap:8px;align-items:center;}
 .ot.show{display:flex;}
 .ot-tit{color:var(--d);font-weight:800;font-size:.88rem;width:100%;margin-bottom:2px;}
 .ob{background:var(--d);color:#000;border:none;padding:9px 15px;border-radius:50px;
   font-weight:700;cursor:pointer;font-size:.8rem;font-family:inherit;white-space:nowrap;}
 .ob.sec{background:rgba(212,175,55,.18);color:var(--d);border:1px solid var(--d);}
 .ob.sal{background:transparent;color:#ccc;border:1px solid #666;}
-
 /* MODALES */
-.mo{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.82);
+.mo{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.85);
   display:none;align-items:center;justify-content:center;padding:16px;}
 .mo.show{display:flex;}
-.mb{background:var(--g);border:1px solid rgba(212,175,55,.5);border-radius:18px;
-  padding:26px 22px;width:100%;text-align:center;}
-
+.mb{background:var(--g);border:1px solid rgba(212,175,55,.5);border-radius:18px;padding:26px 22px;width:100%;}
 /* Modal clave */
-.mb-cl{max-width:340px;}
+.mb-cl{max-width:320px;text-align:center;}
 .mb-cl h3{color:var(--d);margin-bottom:5px;font-size:1.1rem;}
-.mb-cl p{color:#aaa;font-size:.82rem;margin-bottom:14px;}
-.mb-cl input{width:100%;background:#111;border:1px solid rgba(212,175,55,.4);color:var(--t);
-  padding:13px;border-radius:10px;font-size:1.3rem;text-align:center;letter-spacing:4px;margin-bottom:14px;}
-.mb-cl input:focus{outline:2px solid var(--d);}
+.mb-cl p{color:#aaa;font-size:.82rem;margin-bottom:16px;}
+.cl-digits{display:flex;gap:10px;justify-content:center;margin-bottom:16px;}
+.cl-digits input{width:42px;height:52px;background:#111;border:2px solid rgba(212,175,55,.4);
+  color:var(--d);font-size:1.4rem;font-weight:800;text-align:center;border-radius:10px;
+  font-family:inherit;-webkit-appearance:none;}
+.cl-digits input:focus{outline:none;border-color:var(--d);}
 .mfila{display:flex;gap:9px;}
 .mfila button{flex:1;}
 .bc{background:transparent;border:1px solid #555;color:#ccc;padding:11px;border-radius:50px;
   cursor:pointer;font-weight:600;font-family:inherit;font-size:.88rem;}
-
 /* Modal ajustes */
 .mb-aj{max-width:470px;text-align:left;max-height:88vh;overflow-y:auto;}
 .mb-aj h3{text-align:center;color:var(--d);margin-bottom:4px;font-size:1.05rem;}
 .mb-aj > p{text-align:center;color:#aaa;font-size:.8rem;margin-bottom:6px;}
-.asec{background:rgba(212,175,55,.06);border:1px dashed rgba(212,175,55,.35);
-  border-radius:11px;padding:14px;margin:11px 0;}
+.asec{background:rgba(212,175,55,.06);border:1px dashed rgba(212,175,55,.35);border-radius:11px;padding:14px;margin:11px 0;}
 .asec h4{color:var(--d);font-size:.88rem;margin-bottom:11px;}
 .afila{display:flex;align-items:center;gap:9px;margin-bottom:9px;flex-wrap:wrap;}
 .afila label{font-size:.83rem;color:#ccc;min-width:110px;flex:1;}
-.afila input[type="text"],.afila input[type="number"]{
-  flex:1;min-width:110px;background:#111;border:1px solid rgba(212,175,55,.4);
-  color:var(--d);font-weight:600;padding:8px 11px;border-radius:8px;font-size:.88rem;}
+.afila input[type="text"],.afila input[type="number"]{flex:1;min-width:110px;background:#111;
+  border:1px solid rgba(212,175,55,.4);color:var(--d);font-weight:600;padding:8px 11px;border-radius:8px;font-size:.88rem;}
 .afila input:focus{outline:2px solid var(--d);}
 .bfoto{background:rgba(212,175,55,.14);color:var(--d);border:1px solid var(--d);
   padding:8px 14px;border-radius:50px;cursor:pointer;font-size:.8rem;font-family:inherit;font-weight:700;}
 .bfoto:hover{background:var(--d);color:#000;}
 .mini{width:58px;height:58px;object-fit:cover;border-radius:8px;border:2px solid var(--d);display:none;}
-/* Bloque de cada corte en ajustes */
-.cblq{background:rgba(255,255,255,.04);border:1px solid rgba(212,175,55,.18);
-  border-radius:9px;padding:11px;margin-bottom:10px;}
+.cblq{background:rgba(255,255,255,.04);border:1px solid rgba(212,175,55,.18);border-radius:9px;padding:11px;margin-bottom:10px;}
 .cblq .ct{color:var(--d);font-size:.78rem;font-weight:700;margin-bottom:7px;}
 .cblq label{font-size:.77rem;color:#999;display:block;margin-bottom:2px;}
 .cblq input{width:100%;background:#111;border:1px solid rgba(212,175,55,.3);color:var(--d);
@@ -189,7 +697,7 @@ footer b{color:var(--d);}
 .bguar:hover{transform:scale(1.04);}
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html" class="">
 
 <div class="bg"></div>
 <div class="poste"></div>
@@ -197,7 +705,7 @@ footer b{color:var(--d);}
   <span>✂️</span><span>💈</span><span>🪒</span><span>💈</span><span>✂️</span>
 </div>
 
-<!-- TOOLBAR MODO DUEÑO -->
+<!-- TOOLBAR -->
 <div class="ot" id="ot">
   <div class="ot-tit">🔓 Modo Dueño · Style Modern</div>
   <button class="ob" onclick="abrirAj()">⚙️ Ajustes</button>
@@ -206,12 +714,21 @@ footer b{color:var(--d);}
   <button class="ob sal" onclick="salir()">🚪 Salir</button>
 </div>
 
-<!-- MODAL CLAVE -->
+<!-- MODAL CLAVE: 8 casillas individuales -->
 <div class="mo" id="moClave">
   <div class="mb mb-cl">
     <h3>🔒 Modo Dueño</h3>
-    <p>Ingresa tu clave de acceso</p>
-    <input type="password" id="iClave" placeholder="••••••••" inputmode="numeric" maxlength="12">
+    <p>Ingresa tu clave de 8 dígitos</p>
+    <div class="cl-digits">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d0">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d1">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d2">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d3">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d4">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d5">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d6">
+      <input type="number" class="dc" maxlength="1" min="0" max="9" id="d7">
+    </div>
     <div class="mfila">
       <button class="bc" onclick="cerrarClave()">Cancelar</button>
       <button class="bguar" style="flex:1;" onclick="verificar()">Ingresar</button>
@@ -224,7 +741,6 @@ footer b{color:var(--d);}
   <div class="mb mb-aj">
     <h3>⚙️ Ajustes</h3>
     <p>Modifica todo y pulsa Guardar</p>
-
     <div class="asec">
       <h4>📋 Datos del negocio</h4>
       <div class="afila"><label>WhatsApp (51...)</label><input type="text" id="cWa"></div>
@@ -232,34 +748,30 @@ footer b{color:var(--d);}
       <div class="afila"><label>Dirección</label><input type="text" id="cDi"></div>
       <div class="afila"><label>Horario</label><input type="text" id="cHo"></div>
     </div>
-
     <div class="asec">
       <h4>💜 Foto QR de Yape</h4>
       <div class="afila">
-        <img id="minYp" class="mini">
+        <img id="minYp" class="mini" style="display: none;">
         <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
           <button class="bfoto" id="btnSubYp">📷 Subir foto Yape</button>
           <button class="bfoto" id="btnQYp" style="display:none;" onclick="quitarYp()">🗑️ Quitar foto</button>
         </div>
       </div>
     </div>
-
     <div class="asec">
       <h4>📍 Foto QR de Ubicación</h4>
       <div class="afila">
-        <img id="minLo" class="mini">
+        <img id="minLo" class="mini" style="display: none;">
         <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
           <button class="bfoto" id="btnSubLo">📷 Subir foto Ubicación</button>
           <button class="bfoto" id="btnQLo" style="display:none;" onclick="quitarLo()">🗑️ Quitar foto</button>
         </div>
       </div>
     </div>
-
     <div class="asec">
       <h4>✂️ Cortes (nombre, descripción y precio)</h4>
-      <div id="ajCortes"></div>
+      <div id="ajCortes"><div class="cblq"><div class="ct">✂️ Corte #1</div><label>Nombre</label><input type="text" id="an1" value="Fade Clásico"><label>Descripción</label><input type="text" id="ad1" value="Degradado limpio y moderno, ideal para todo estilo."><label>Precio (S/)</label><input type="number" id="ap1" min="1" step="1" value="15"></div><div class="cblq"><div class="ct">✂️ Corte #2</div><label>Nombre</label><input type="text" id="an2" value="Corte Texturizado"><label>Descripción</label><input type="text" id="ad2" value="Textura en la parte superior, muy juvenil y actual."><label>Precio (S/)</label><input type="number" id="ap2" min="1" step="1" value="18"></div><div class="cblq"><div class="ct">✂️ Corte #3</div><label>Nombre</label><input type="text" id="an3" value="Mullet Moderno"><label>Descripción</label><input type="text" id="ad3" value="Estilo retro-vanguardia, tendencia entre jóvenes."><label>Precio (S/)</label><input type="number" id="ap3" min="1" step="1" value="20"></div><div class="cblq"><div class="ct">✂️ Corte #4</div><label>Nombre</label><input type="text" id="an4" value="Buzz Cut / Rapado"><label>Descripción</label><input type="text" id="ad4" value="Corte al ras, rápido y de bajo mantenimiento."><label>Precio (S/)</label><input type="number" id="ap4" min="1" step="1" value="12"></div><div class="cblq"><div class="ct">✂️ Corte #5</div><label>Nombre</label><input type="text" id="an5" value="Pompadour Clásico"><label>Descripción</label><input type="text" id="ad5" value="Elegancia para adultos, ideal para oficina."><label>Precio (S/)</label><input type="number" id="ap5" min="1" step="1" value="22"></div><div class="cblq"><div class="ct">✂️ Corte #6</div><label>Nombre</label><input type="text" id="an6" value="Corte con Diseño"><label>Descripción</label><input type="text" id="ad6" value="Líneas y diseños personalizados, tu estilo único."><label>Precio (S/)</label><input type="number" id="ap6" min="1" step="1" value="25"></div><div class="cblq"><div class="ct">✂️ Corte #7</div><label>Nombre</label><input type="text" id="an7" value="Barba + Corte"><label>Descripción</label><input type="text" id="ad7" value="Servicio completo: corte moderno + perfilado de barba."><label>Precio (S/)</label><input type="number" id="ap7" min="1" step="1" value="28"></div><div class="cblq"><div class="ct">✂️ Corte #8</div><label>Nombre</label><input type="text" id="an8" value="Corte Niños"><label>Descripción</label><input type="text" id="ad8" value="Paciencia y estilo para los más pequeños."><label>Precio (S/)</label><input type="number" id="ap8" min="1" step="1" value="12"></div></div>
     </div>
-
     <div style="display:flex;gap:9px;margin-top:6px;">
       <button class="bc" style="flex:1;" onclick="cerrarAj()">Cancelar</button>
       <button class="bguar" style="flex:2;" onclick="guardarAj()">💾 Guardar cambios</button>
@@ -280,7 +792,6 @@ footer b{color:var(--d);}
   </nav>
 </header>
 
-<!-- HERO -->
 <div class="hero">
   <h1>Estilo que <b>marca</b> diferencia</h1>
   <p>Los mejores cortes actuales para jóvenes y adultos en San Juan de Lurigancho. Precios accesibles, atención personalizada y pago con Yape.</p>
@@ -288,14 +799,12 @@ footer b{color:var(--d);}
   <a href="#cortes" class="btn btn-o">Ver Cortes</a>
 </div>
 
-<!-- CORTES -->
 <section id="cortes">
   <h2 class="sec-t">Nuestros <b>Cortes</b></h2>
   <p class="sec-s">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
-  <div class="grid" id="gridCortes"></div>
+  <div class="grid" id="gridCortes"><div class="card"><button class="pin" data-accion="foto-corte" data-id="1">✏️</button><img src="https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&amp;q=80" alt="Fade Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Fade Clásico</h3><p class="desc">Degradado limpio y moderno, ideal para todo estilo.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="1">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="2">✏️</button><img src="https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&amp;q=80" alt="JCorte Texturizado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>JCorte Texturizado</h3><p class="desc">Textura en la parte superior, muy juvenil y actual.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="2">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="3">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Mullet Moderno" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Mullet Moderno</h3><p class="desc">Estilo retro-vanguardia, tendencia entre jóvenes.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="3">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="4">✏️</button><img src="https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&amp;q=80" alt="Buzz Cut / Rapado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Buzz Cut / Rapado</h3><p class="desc">Corte al ras, rápido y de bajo mantenimiento.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="4">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="5">✏️</button><img src="https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&amp;q=80" alt="Pompadour Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Pompadour Clásico</h3><p class="desc">Elegancia para adultos, ideal para oficina.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="5">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="6">✏️</button><img src="https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&amp;q=80" alt="Corte con Diseño" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Corte con Diseño</h3><p class="desc">Líneas y diseños personalizados, tu estilo único.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="6">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="7">✏️</button><img src="https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&amp;q=80" alt="Barba + Corte" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Barba + Corte</h3><p class="desc">Servicio completo: corte moderno + perfilado de barba.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="7">Reservar este corte</button></div></div><div class="card"><button class="pin" data-accion="foto-corte" data-id="8">✏️</button><img src="https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&amp;q=80" alt="Corte Niños" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="cbody"><h3>Corte Niños</h3><p class="desc">Paciencia y estilo para los más pequeños.</p><div class="precio">60.00</div><button class="btn" data-accion="reservar" data-id="8">Reservar este corte</button></div></div></div>
 </section>
 
-<!-- RESERVA -->
 <section id="reservar">
   <h2 class="sec-t">Reserva tu <b>Cita</b></h2>
   <p class="sec-s">Envía tu reserva directo al WhatsApp del local</p>
@@ -303,9 +812,9 @@ footer b{color:var(--d);}
     <div class="fg"><label>Nombre completo</label>
       <input type="text" id="iCli" placeholder="Ej: Juan Pérez"></div>
     <div class="fg"><label>Servicio / Corte</label>
-      <select id="iSrv" onchange="calcTotal()"></select></div>
+      <select id="iSrv" onchange="calcTotal()"><option value="">-- Selecciona un corte --</option><option value="1">Fade Clásico — S/ 60.00</option><option value="2">JCorte Texturizado — S/ 60.00</option><option value="3">Mullet Moderno — S/ 60.00</option><option value="4">Buzz Cut / Rapado — S/ 60.00</option><option value="5">Pompadour Clásico — S/ 60.00</option><option value="6">Corte con Diseño — S/ 60.00</option><option value="7">Barba + Corte — S/ 60.00</option><option value="8">Corte Niños — S/ 60.00</option></select></div>
     <div class="fgrid">
-      <div class="fg"><label>Fecha</label><input type="date" id="iFech"></div>
+      <div class="fg"><label>Fecha</label><input type="date" id="iFech" min="2026-11-08"></div>
       <div class="fg"><label>Hora</label>
         <select id="iHora">
           <option value="">-- Selecciona --</option>
@@ -328,7 +837,7 @@ footer b{color:var(--d);}
     <div id="panelYape" style="text-align:center;margin-top:16px;">
       <div class="qr-box">
         <button class="pin" id="pinYape">✏️</button>
-        <img id="imgYape" src="" alt="QR Yape">
+        <img id="imgYape" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=YAPE-STYLEMODERN-999888777" alt="QR Yape">
         <div class="qr-info">Escanea con tu app Yape · <b>Style Modern</b></div>
       </div>
       <p style="font-size:.8rem;color:#aaa;margin-top:7px;">
@@ -341,14 +850,13 @@ footer b{color:var(--d);}
   </div>
 </section>
 
-<!-- UBICACIÓN -->
 <section id="ubic">
   <h2 class="sec-t">Nuestra <b>Ubicación</b></h2>
   <p class="sec-s">Escanea el QR o ven a visitarnos</p>
   <div class="qr-wrap">
     <div class="qr-box">
       <button class="pin" id="pinLocal">✏️</button>
-      <img id="imgLocal" src="" alt="QR Ubicación">
+      <img id="imgLocal" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https%3A%2F%2Fmaps.google.com%2F%3Fq%3DAv.%20Principal%20SJL%2C%20Lima%20San%20Juan%20de%20Lurigancho%20%C2%B7%20Lima%2C%20Per%C3%BA" alt="QR Ubicación">
       <div class="qr-info">Style Modern · San Juan de Lurigancho</div>
     </div>
     <p style="color:#aaa;font-size:.88rem;margin-top:12px;">
@@ -358,422 +866,456 @@ footer b{color:var(--d);}
   </div>
 </section>
 
-<!-- FOOTER -->
 <footer id="pie">
   <div style="font-size:1.4rem;margin-bottom:9px;">💈 <b>STYLE MODERN</b> 💈</div>
   <div class="foot-info">
     📍 <span id="tDirF">San Juan de Lurigancho · Lima, Perú</span><br>
-    📞 WhatsApp: <b id="tWaF">+51 999 888 777</b><br>
-    🕐 <span id="tHorF">Lunes a Domingo · 9:00 am - 8:00 pm</span><br>
+    📞 WhatsApp: <b id="tWaF">+51999888777</b><br>
+    🕐 <span id="tHorF">Lun a Dom: 9:00 am - 8:00 pm</span><br>
     💳 Aceptamos Yape · Efectivo
   </div>
-  <p style="margin-top:18px;color:#555;font-size:.73rem;">
-    © 2025 Style Modern Barbería · Todos los derechos reservados
-  </p>
+  <p style="margin-top:18px;color:#555;font-size:.73rem;">© 2025 Style Modern Barbería</p>
 </footer>
 
-<a class="wa" id="linkWA" href="#" target="_blank">💬</a>
-<div class="toast" id="toast"></div>
+<a class="wa" id="linkWA" href="https://wa.me/51999888777?text=Hola%2C%20quiero%20informaci%C3%B3n%20sobre%20los%20cortes%20%F0%9F%92%88" target="_blank">💬</a>
+<div class="toast" id="toast">✅ Cambios guardados</div>
 <input type="file" id="fileFoto" accept="image/*" style="display:none;">
 
-<!-- DATOS DEL SITIO -->
-<script type="application/json" id="SD">{"cfg":{"wa":"51999888777","neg":"Style Modern","yp":"999 888 777","dir":"Av. Principal SJL, Lima","hor":"Lun a Dom: 9:00 am - 8:00 pm","horF":"Lunes a Domingo \u00b7 9:00 am - 8:00 pm","ubic":"San Juan de Lurigancho \u00b7 Lima, Per\u00fa","imgYp":null,"imgLo":null},"lista":[{"id":1,"n":"Fade Cl\u00e1sico","d":"Degradado limpio y moderno, ideal para todo estilo.","p":15,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"n":"Corte Texturizado","d":"Textura en la parte superior, muy juvenil y actual.","p":18,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"n":"Mullet Moderno","d":"Estilo retro-vanguardia, tendencia entre j\u00f3venes.","p":20,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":4,"n":"Buzz Cut \/ Rapado","d":"Corte al ras, r\u00e1pido y de bajo mantenimiento.","p":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"n":"Pompadour Cl\u00e1sico","d":"Elegancia para adultos, ideal para oficina.","p":22,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"n":"Corte con Dise\u00f1o","d":"L\u00edneas y dise\u00f1os personalizados, tu estilo \u00fanico.","p":25,"img":"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},{"id":7,"n":"Barba + Corte","d":"Servicio completo: corte moderno + perfilado de barba.","p":28,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"n":"Corte Ni\u00f1os","d":"Paciencia y estilo para los m\u00e1s peque\u00f1os.","p":12,"img":"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}]}</script>
+<script type="application/json" id="SD">{"cfg":{"wa":"51999888777","neg":"Style Modern","yp":"999 888 777","dir":"Av. Principal SJL, Lima","hor":"Lun a Dom: 9:00 am - 8:00 pm","horF":"Lun a Dom: 9:00 am - 8:00 pm","ubic":"San Juan de Lurigancho · Lima, Perú","imgYp":null,"imgLo":null},"lista":[{"id":1,"n":"Fade Clásico","d":"Degradado limpio y moderno, ideal para todo estilo.","p":60,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"n":"JCorte Texturizado","d":"Textura en la parte superior, muy juvenil y actual.","p":60,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"n":"Mullet Moderno","d":"Estilo retro-vanguardia, tendencia entre jóvenes.","p":60,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":4,"n":"Buzz Cut / Rapado","d":"Corte al ras, rápido y de bajo mantenimiento.","p":60,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"n":"Pompadour Clásico","d":"Elegancia para adultos, ideal para oficina.","p":60,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"n":"Corte con Diseño","d":"Líneas y diseños personalizados, tu estilo único.","p":60,"img":"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},{"id":7,"n":"Barba + Corte","d":"Servicio completo: corte moderno + perfilado de barba.","p":60,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"n":"Corte Niños","d":"Paciencia y estilo para los más pequeños.","p":60,"img":"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}]}</script>
 
 <script>
 window.addEventListener("DOMContentLoaded", function() {
 
-/* ── DATOS ── */
-var SD = document.getElementById("SD");
-var D;
-try { D = JSON.parse(SD.textContent); } catch(e) { D = null; }
-if (!D || !D.cfg || !Array.isArray(D.lista) || D.lista.length === 0) {
-  D = {
-    cfg:{wa:"51999888777",neg:"Style Modern",yp:"999 888 777",
-         dir:"Av. Principal SJL, Lima",hor:"Lun a Dom: 9:00 am - 8:00 pm",
-         horF:"Lunes a Domingo · 9:00 am - 8:00 pm",
-         ubic:"San Juan de Lurigancho · Lima, Perú",imgYp:null,imgLo:null},
-    lista:[
-      {id:1,n:"Fade Clásico",d:"Degradado limpio y moderno.",p:15,img:"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},
-      {id:2,n:"Corte Texturizado",d:"Textura juvenil y actual.",p:18,img:"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},
-      {id:3,n:"Mullet Moderno",d:"Retro-vanguardia, tendencia joven.",p:20,img:"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},
-      {id:4,n:"Buzz Cut / Rapado",d:"Al ras, rápido y bajo mantenimiento.",p:12,img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},
-      {id:5,n:"Pompadour Clásico",d:"Elegancia para adultos.",p:22,img:"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},
-      {id:6,n:"Corte con Diseño",d:"Líneas y diseños únicos.",p:25,img:"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},
-      {id:7,n:"Barba + Corte",d:"Corte moderno + perfilado de barba.",p:28,img:"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},
-      {id:8,n:"Corte Niños",d:"Paciencia y estilo para los más pequeños.",p:12,img:"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}
-    ]
-  };
-}
-
-/* Estado */
-var isOwner = false;
-var toques = 0, timerT = null;
-var fotoTarget = null;
-var pagoActual = "yape";
-var CLAVE = "29101991";
-
-/* ── GUARDAR ── */
-function guardar() {
-  SD.textContent = JSON.stringify(D);
-  try { localStorage.setItem("SM3", JSON.stringify(D)); } catch(e){}
-}
-
-/* ── RENDER CORTES ── */
-function renderCortes() {
-  var html = "";
-  for (var i = 0; i < D.lista.length; i++) {
-    var c = D.lista[i];
-    html += '<div class="card">';
-    html += '<button class="pin" data-accion="foto-corte" data-id="'+c.id+'">✏️</button>';
-    html += '<img src="'+esc(c.img)+'" alt="'+esc(c.n)+'" loading="lazy" onerror="this.src=\'https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80\'">';
-    html += '<div class="cbody">';
-    html += '<h3>'+esc(c.n)+'</h3>';
-    html += '<p class="desc">'+esc(c.d)+'</p>';
-    html += '<div class="precio">'+Number(c.p).toFixed(2)+'</div>';
-    html += '<button class="btn" data-accion="reservar" data-id="'+c.id+'">Reservar este corte</button>';
-    html += '</div></div>';
-  }
-  document.getElementById("gridCortes").innerHTML = html;
-}
-
-/* ── RENDER SELECT ── */
-function renderSelect() {
-  var html = '<option value="">-- Selecciona un corte --</option>';
-  for (var i = 0; i < D.lista.length; i++) {
-    var c = D.lista[i];
-    html += '<option value="'+c.id+'">'+esc(c.n)+' — S/ '+Number(c.p).toFixed(2)+'</option>';
-  }
-  document.getElementById("iSrv").innerHTML = html;
-}
-
-/* ── TEXTOS ── */
-function aplicarTextos() {
-  document.getElementById("tDir").textContent  = D.cfg.dir;
-  document.getElementById("tHor").textContent  = D.cfg.hor;
-  document.getElementById("tDirF").textContent = D.cfg.ubic;
-  document.getElementById("tWaF").textContent  = "+"+D.cfg.wa;
-  document.getElementById("tHorF").textContent = D.cfg.horF;
-  document.getElementById("tYape").textContent = D.cfg.yp;
-}
-
-function aplicarQRs() {
-  var qrBase = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=";
-  document.getElementById("imgYape").src  = D.cfg.imgYp || (qrBase+encodeURIComponent("YAPE-STYLEMODERN-"+D.cfg.yp.replace(/\s/g,"")));
-  document.getElementById("imgLocal").src = D.cfg.imgLo || (qrBase+encodeURIComponent("https://maps.google.com/?q="+D.cfg.dir+" "+D.cfg.ubic));
-  document.getElementById("linkWA").href  = "https://wa.me/"+D.cfg.wa+"?text="+encodeURIComponent("Hola, quiero información sobre los cortes 💈");
-}
-
-/* ── 3 TOQUES LOGO ── */
-document.getElementById("logo").addEventListener("click", function() {
-  if (isOwner) return;
-  toques++;
-  clearTimeout(timerT);
-  timerT = setTimeout(function(){ toques = 0; }, 1200);
-  if (toques >= 3) { toques = 0; abrirClave(); }
-});
-
-/* ── CLAVE ── */
-function abrirClave() {
-  document.getElementById("iClave").value = "";
-  document.getElementById("moClave").classList.add("show");
-  setTimeout(function(){ document.getElementById("iClave").focus(); }, 150);
-}
-function cerrarClave() { document.getElementById("moClave").classList.remove("show"); }
-
-document.getElementById("iClave").addEventListener("keydown", function(e){
-  if (e.key === "Enter") verificar();
-});
-
-function verificar() {
-  if (document.getElementById("iClave").value.trim() === CLAVE) {
-    cerrarClave();
-    activar();
-  } else {
-    toast("❌ Clave incorrecta");
-    document.getElementById("iClave").value = "";
-  }
-}
-
-/* ── ACTIVAR / SALIR ── */
-function activar() {
-  isOwner = true;
-  document.body.classList.add("md");
-  document.getElementById("ot").classList.add("show");
-  renderCortes();
-}
-
-function salir() {
-  isOwner = false;
-  document.body.classList.remove("md");
-  document.getElementById("ot").classList.remove("show");
-  cerrarAj();
-  renderCortes();
-}
-
-/* ── AJUSTES ── */
-function abrirAj() {
-  document.getElementById("cWa").value = D.cfg.wa;
-  document.getElementById("cYp").value = D.cfg.yp;
-  document.getElementById("cDi").value = D.cfg.dir;
-  document.getElementById("cHo").value = D.cfg.hor;
-
-  var minYp = document.getElementById("minYp");
-  var minLo = document.getElementById("minLo");
-  var bQYp  = document.getElementById("btnQYp");
-  var bQLo  = document.getElementById("btnQLo");
-  if (D.cfg.imgYp){ minYp.src=D.cfg.imgYp; minYp.style.display="block"; bQYp.style.display="block"; }
-  else { minYp.style.display="none"; bQYp.style.display="none"; }
-  if (D.cfg.imgLo){ minLo.src=D.cfg.imgLo; minLo.style.display="block"; bQLo.style.display="block"; }
-  else { minLo.style.display="none"; bQLo.style.display="none"; }
-
-  var html = "";
-  for (var i = 0; i < D.lista.length; i++) {
-    var c = D.lista[i];
-    html += '<div class="cblq">';
-    html += '<div class="ct">✂️ Corte #'+(i+1)+'</div>';
-    html += '<label>Nombre</label>';
-    html += '<input type="text" id="an'+c.id+'" value="'+escH(c.n)+'">';
-    html += '<label>Descripción</label>';
-    html += '<input type="text" id="ad'+c.id+'" value="'+escH(c.d)+'">';
-    html += '<label>Precio (S/)</label>';
-    html += '<input type="number" id="ap'+c.id+'" min="1" step="1" value="'+c.p+'">';
-    html += '</div>';
-  }
-  document.getElementById("ajCortes").innerHTML = html;
-  document.getElementById("moAj").classList.add("show");
-}
-
-function cerrarAj() { document.getElementById("moAj").classList.remove("show"); }
-
-function guardarAj() {
-  var wa = document.getElementById("cWa").value.trim();
-  var yp = document.getElementById("cYp").value.trim();
-  var di = document.getElementById("cDi").value.trim();
-  var ho = document.getElementById("cHo").value.trim();
-  if (wa) D.cfg.wa  = wa;
-  if (yp) D.cfg.yp  = yp;
-  if (di) D.cfg.dir = di;
-  if (ho) { D.cfg.hor = ho; D.cfg.horF = ho; }
-
-  for (var i = 0; i < D.lista.length; i++) {
-    var c  = D.lista[i];
-    var eN = document.getElementById("an"+c.id);
-    var eD = document.getElementById("ad"+c.id);
-    var eP = document.getElementById("ap"+c.id);
-    if (eN && eN.value.trim()) c.n = eN.value.trim();
-    if (eD && eD.value.trim()) c.d = eD.value.trim();
-    var v = parseFloat(eP ? eP.value : c.p);
-    if (!isNaN(v) && v > 0) c.p = v;
+  /* ── DATOS ── */
+  var SD = document.getElementById("SD");
+  var D;
+  try { D = JSON.parse(SD.textContent); } catch(e) { D = null; }
+  if (!D || !D.cfg || !Array.isArray(D.lista) || D.lista.length === 0) {
+    D = {
+      cfg:{wa:"51999888777",neg:"Style Modern",yp:"999 888 777",
+           dir:"Av. Principal SJL, Lima",hor:"Lun a Dom: 9:00 am - 8:00 pm",
+           horF:"Lunes a Domingo · 9:00 am - 8:00 pm",
+           ubic:"San Juan de Lurigancho · Lima, Perú",imgYp:null,imgLo:null},
+      lista:[
+        {id:1,n:"Fade Clásico",d:"Degradado limpio y moderno.",p:15,img:"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},
+        {id:2,n:"Corte Texturizado",d:"Textura juvenil y actual.",p:18,img:"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},
+        {id:3,n:"Mullet Moderno",d:"Retro-vanguardia, tendencia joven.",p:20,img:"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},
+        {id:4,n:"Buzz Cut / Rapado",d:"Al ras, rápido y bajo mantenimiento.",p:12,img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},
+        {id:5,n:"Pompadour Clásico",d:"Elegancia para adultos.",p:22,img:"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},
+        {id:6,n:"Corte con Diseño",d:"Líneas y diseños únicos.",p:25,img:"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},
+        {id:7,n:"Barba + Corte",d:"Corte moderno + perfilado de barba.",p:28,img:"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},
+        {id:8,n:"Corte Niños",d:"Paciencia y estilo para los más pequeños.",p:12,img:"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}
+      ]
+    };
   }
 
-  guardar();
+  var isOwner    = false;
+  var toques     = 0;
+  var timerT     = null;
+  var fotoTarget = null;
+  var pagoActual = "yape";
+
+  /* ── GUARDAR ── */
+  function guardar() {
+    SD.textContent = JSON.stringify(D);
+    try { localStorage.setItem("SM4", JSON.stringify(D)); } catch(e) {}
+  }
+
+  /* ── RENDER ── */
+  function renderCortes() {
+    var h = "";
+    for (var i = 0; i < D.lista.length; i++) {
+      var c = D.lista[i];
+      h += '<div class="card">';
+      h += '<button class="pin" data-accion="foto-corte" data-id="' + c.id + '">✏️</button>';
+      h += '<img src="' + xss(c.img) + '" alt="' + xss(c.n) + '" loading="lazy" onerror="this.src=\'https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80\'">';
+      h += '<div class="cbody"><h3>' + xss(c.n) + '</h3>';
+      h += '<p class="desc">' + xss(c.d) + '</p>';
+      h += '<div class="precio">' + Number(c.p).toFixed(2) + '</div>';
+      h += '<button class="btn" data-accion="reservar" data-id="' + c.id + '">Reservar este corte</button>';
+      h += '</div></div>';
+    }
+    document.getElementById("gridCortes").innerHTML = h;
+  }
+
+  function renderSelect() {
+    var h = '<option value="">-- Selecciona un corte --</option>';
+    for (var i = 0; i < D.lista.length; i++) {
+      var c = D.lista[i];
+      h += '<option value="' + c.id + '">' + xss(c.n) + ' — S/ ' + Number(c.p).toFixed(2) + '</option>';
+    }
+    document.getElementById("iSrv").innerHTML = h;
+  }
+
+  function aplicarTextos() {
+    document.getElementById("tDir").textContent  = D.cfg.dir;
+    document.getElementById("tHor").textContent  = D.cfg.hor;
+    document.getElementById("tDirF").textContent = D.cfg.ubic;
+    document.getElementById("tWaF").textContent  = "+" + D.cfg.wa;
+    document.getElementById("tHorF").textContent = D.cfg.horF;
+    document.getElementById("tYape").textContent = D.cfg.yp;
+  }
+
+  function aplicarQRs() {
+    var base = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=";
+    document.getElementById("imgYape").src  = D.cfg.imgYp || (base + encodeURIComponent("YAPE-STYLEMODERN-" + D.cfg.yp.replace(/\s/g, "")));
+    document.getElementById("imgLocal").src = D.cfg.imgLo || (base + encodeURIComponent("https://maps.google.com/?q=" + D.cfg.dir + " " + D.cfg.ubic));
+    document.getElementById("linkWA").href  = "https://wa.me/" + D.cfg.wa + "?text=" + encodeURIComponent("Hola, quiero información sobre los cortes 💈");
+  }
+
+  /* ── 3 TOQUES EN LOGO ── */
+  document.getElementById("logo").addEventListener("click", function() {
+    if (isOwner) return;
+    toques++;
+    clearTimeout(timerT);
+    timerT = setTimeout(function() { toques = 0; }, 1200);
+    if (toques >= 3) { toques = 0; abrirClave(); }
+  });
+
+  /* ── CLAVE: 8 casillas individuales ── */
+  var celdas = document.querySelectorAll(".dc");
+
+  /* Navegar entre celdas automáticamente */
+  for (var ci = 0; ci < celdas.length; ci++) {
+    (function(idx) {
+      celdas[idx].addEventListener("input", function() {
+        /* Dejar solo 1 dígito */
+        var v = this.value.replace(/[^0-9]/g, "");
+        this.value = v.slice(-1);
+        /* Avanzar al siguiente */
+        if (this.value !== "" && idx < celdas.length - 1) {
+          celdas[idx + 1].focus();
+        }
+        /* Si ya llenó las 8, verificar automáticamente */
+        if (idx === celdas.length - 1 && this.value !== "") {
+          verificar();
+        }
+      });
+      celdas[idx].addEventListener("keydown", function(e) {
+        if (e.key === "Backspace" && this.value === "" && idx > 0) {
+          celdas[idx - 1].focus();
+        }
+        if (e.key === "Enter") { verificar(); }
+      });
+    })(ci);
+  }
+
+  function abrirClave() {
+    for (var i = 0; i < celdas.length; i++) { celdas[i].value = ""; }
+    document.getElementById("moClave").classList.add("show");
+    setTimeout(function() { celdas[0].focus(); }, 150);
+  }
+
+  function cerrarClave() {
+    document.getElementById("moClave").classList.remove("show");
+  }
+
+  function verificar() {
+    var clave = "";
+    for (var i = 0; i < celdas.length; i++) {
+      clave += (celdas[i].value || "");
+    }
+    if (clave === "29101991") {
+      cerrarClave();
+      activar();
+    } else {
+      toast("❌ Clave incorrecta");
+      for (var j = 0; j < celdas.length; j++) { celdas[j].value = ""; }
+      setTimeout(function() { celdas[0].focus(); }, 100);
+    }
+  }
+
+  /* ── ACTIVAR / SALIR ── */
+  function activar() {
+    isOwner = true;
+    document.body.classList.add("md");
+    document.getElementById("ot").classList.add("show");
+    renderCortes();
+  }
+
+  function salir() {
+    isOwner = false;
+    document.body.classList.remove("md");
+    document.getElementById("ot").classList.remove("show");
+    cerrarAj();
+    renderCortes();
+  }
+
+  /* Exponer salir globalmente para el botón del toolbar */
+  window.salir = salir;
+
+  /* ── AJUSTES ── */
+  function abrirAj() {
+    document.getElementById("cWa").value = D.cfg.wa;
+    document.getElementById("cYp").value = D.cfg.yp;
+    document.getElementById("cDi").value = D.cfg.dir;
+    document.getElementById("cHo").value = D.cfg.hor;
+
+    var minYp = document.getElementById("minYp");
+    var minLo = document.getElementById("minLo");
+    var bQYp  = document.getElementById("btnQYp");
+    var bQLo  = document.getElementById("btnQLo");
+    if (D.cfg.imgYp) { minYp.src = D.cfg.imgYp; minYp.style.display = "block"; bQYp.style.display = "block"; }
+    else             { minYp.style.display = "none"; bQYp.style.display = "none"; }
+    if (D.cfg.imgLo) { minLo.src = D.cfg.imgLo; minLo.style.display = "block"; bQLo.style.display = "block"; }
+    else             { minLo.style.display = "none"; bQLo.style.display = "none"; }
+
+    var h = "";
+    for (var i = 0; i < D.lista.length; i++) {
+      var c = D.lista[i];
+      h += '<div class="cblq">';
+      h += '<div class="ct">✂️ Corte #' + (i + 1) + '</div>';
+      h += '<label>Nombre</label><input type="text" id="an' + c.id + '" value="' + xssQ(c.n) + '">';
+      h += '<label>Descripción</label><input type="text" id="ad' + c.id + '" value="' + xssQ(c.d) + '">';
+      h += '<label>Precio (S/)</label><input type="number" id="ap' + c.id + '" min="1" step="1" value="' + c.p + '">';
+      h += '</div>';
+    }
+    document.getElementById("ajCortes").innerHTML = h;
+    document.getElementById("moAj").classList.add("show");
+  }
+
+  function cerrarAj() { document.getElementById("moAj").classList.remove("show"); }
+
+  function guardarAj() {
+    var wa = document.getElementById("cWa").value.trim();
+    var yp = document.getElementById("cYp").value.trim();
+    var di = document.getElementById("cDi").value.trim();
+    var ho = document.getElementById("cHo").value.trim();
+    if (wa) D.cfg.wa  = wa;
+    if (yp) D.cfg.yp  = yp;
+    if (di) D.cfg.dir = di;
+    if (ho) { D.cfg.hor = ho; D.cfg.horF = ho; }
+
+    for (var i = 0; i < D.lista.length; i++) {
+      var c  = D.lista[i];
+      var eN = document.getElementById("an" + c.id);
+      var eD = document.getElementById("ad" + c.id);
+      var eP = document.getElementById("ap" + c.id);
+      if (eN && eN.value.trim()) c.n = eN.value.trim();
+      if (eD && eD.value.trim()) c.d = eD.value.trim();
+      var v = parseFloat(eP ? eP.value : c.p);
+      if (!isNaN(v) && v > 0) c.p = v;
+    }
+
+    guardar();
+    renderCortes();
+    renderSelect();
+    aplicarTextos();
+    aplicarQRs();
+    cerrarAj();
+    toast("✅ Cambios guardados");
+  }
+
+  function quitarYp() {
+    D.cfg.imgYp = null;
+    document.getElementById("minYp").style.display = "none";
+    document.getElementById("btnQYp").style.display = "none";
+    guardar(); aplicarQRs();
+    toast("✅ Foto Yape quitada");
+  }
+
+  function quitarLo() {
+    D.cfg.imgLo = null;
+    document.getElementById("minLo").style.display = "none";
+    document.getElementById("btnQLo").style.display = "none";
+    guardar(); aplicarQRs();
+    toast("✅ Foto Ubicación quitada");
+  }
+
+  /* Exponer funciones usadas en onclick del HTML */
+  window.abrirAj   = abrirAj;
+  window.cerrarAj  = cerrarAj;
+  window.guardarAj = guardarAj;
+  window.quitarYp  = quitarYp;
+  window.quitarLo  = quitarLo;
+  window.cerrarClave = cerrarClave;
+  window.verificar   = verificar;
+
+  /* ── FOTOS ── */
+  document.getElementById("btnSubYp").addEventListener("click", function() { elegirFoto("yape"); });
+  document.getElementById("btnSubLo").addEventListener("click", function() { elegirFoto("local"); });
+  document.getElementById("pinYape").addEventListener("click",  function() { if (isOwner) elegirFoto("yape"); });
+  document.getElementById("pinLocal").addEventListener("click", function() { if (isOwner) elegirFoto("local"); });
+
+  document.getElementById("gridCortes").addEventListener("click", function(e) {
+    var btn = e.target.closest("[data-accion]");
+    if (!btn) return;
+    var accion = btn.getAttribute("data-accion");
+    var id     = parseInt(btn.getAttribute("data-id"));
+    if (accion === "foto-corte" && isOwner) elegirFoto("corte", id);
+    if (accion === "reservar") reservarCorte(id);
+  });
+
+  function elegirFoto(tipo, id) {
+    fotoTarget = { tipo: tipo, id: id || null };
+    var inp = document.getElementById("fileFoto");
+    inp.value = "";
+    inp.click();
+  }
+
+  document.getElementById("fileFoto").addEventListener("change", function(e) {
+    var file = e.target.files && e.target.files[0];
+    if (!file || !fotoTarget) return;
+    if (!file.type.startsWith("image/")) { toast("⚠️ Elige una imagen"); return; }
+    toast("⏳ Procesando...");
+    var maxW = fotoTarget.tipo === "corte" ? 700 : 450;
+    redim(file, maxW, function(dataUrl) {
+      if (fotoTarget.tipo === "corte") {
+        for (var i = 0; i < D.lista.length; i++) {
+          if (D.lista[i].id === fotoTarget.id) { D.lista[i].img = dataUrl; break; }
+        }
+        guardar(); renderCortes();
+      } else if (fotoTarget.tipo === "yape") {
+        D.cfg.imgYp = dataUrl;
+        var m = document.getElementById("minYp");
+        m.src = dataUrl; m.style.display = "block";
+        document.getElementById("btnQYp").style.display = "block";
+        guardar(); aplicarQRs();
+      } else if (fotoTarget.tipo === "local") {
+        D.cfg.imgLo = dataUrl;
+        var m = document.getElementById("minLo");
+        m.src = dataUrl; m.style.display = "block";
+        document.getElementById("btnQLo").style.display = "block";
+        guardar(); aplicarQRs();
+      }
+      toast("✅ Foto actualizada");
+      fotoTarget = null;
+    });
+  });
+
+  function redim(file, maxW, cb) {
+    var r = new FileReader();
+    r.onload = function(e) {
+      var img = new Image();
+      img.onload = function() {
+        var w = img.width, h = img.height;
+        if (w > maxW) { h = Math.round(h * (maxW / w)); w = maxW; }
+        var cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        cv.getContext("2d").drawImage(img, 0, 0, w, h);
+        cb(cv.toDataURL("image/jpeg", 0.82));
+      };
+      img.onerror = function() { toast("⚠️ No se pudo leer la imagen"); };
+      img.src = e.target.result;
+    };
+    r.onerror = function() { toast("⚠️ Error al leer el archivo"); };
+    r.readAsDataURL(file);
+  }
+
+  /* ── COPIAR / DESCARGAR HTML ── */
+  function htmlLimpio() {
+    salir();
+    guardar();
+    return "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+  }
+
+  function copiarHTML() {
+    var codigo = htmlLimpio();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(codigo).then(function() {
+        toast("📋 ¡Código copiado! Pégalo en GitHub");
+      }).catch(function() { copiarFallback(codigo); });
+    } else {
+      copiarFallback(codigo);
+    }
+  }
+
+  function copiarFallback(codigo) {
+    var ta = document.createElement("textarea");
+    ta.value = codigo;
+    ta.style.cssText = "position:fixed;opacity:0;top:0;left:0;width:1px;height:1px;";
+    document.body.appendChild(ta);
+    ta.focus(); ta.select(); ta.setSelectionRange(0, 999999);
+    try { document.execCommand("copy"); toast("📋 ¡Código copiado! Pégalo en GitHub"); }
+    catch(e) { toast("⚠️ No se pudo copiar automáticamente"); }
+    document.body.removeChild(ta);
+  }
+
+  function descargarHTML() {
+    var codigo = htmlLimpio();
+    var blob = new Blob([codigo], { type: "text/html" });
+    var url  = URL.createObjectURL(blob);
+    var a    = document.createElement("a");
+    a.href = url; a.download = "index.html";
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast("⬇️ Descargando index.html...");
+  }
+
+  window.copiarHTML    = copiarHTML;
+  window.descargarHTML = descargarHTML;
+
+  /* ── RESERVA ── */
+  function reservarCorte(id) {
+    document.getElementById("iSrv").value = id;
+    calcTotal();
+    document.getElementById("reservar").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function calcTotal() {
+    var id = document.getElementById("iSrv").value;
+    var c  = null;
+    for (var i = 0; i < D.lista.length; i++) {
+      if (String(D.lista[i].id) === String(id)) { c = D.lista[i]; break; }
+    }
+    document.getElementById("iTotal").textContent = c ? "S/ " + Number(c.p).toFixed(2) : "S/ 0.00";
+  }
+
+  function setPago(m) {
+    pagoActual = m;
+    document.getElementById("pYape").classList.toggle("activo", m === "yape");
+    document.getElementById("pEfect").classList.toggle("activo", m === "efect");
+    document.getElementById("panelYape").style.display = m === "yape" ? "block" : "none";
+  }
+  window.setPago = setPago;
+
+  function enviarWA() {
+    var cli  = document.getElementById("iCli").value.trim();
+    var id   = document.getElementById("iSrv").value;
+    var fech = document.getElementById("iFech").value;
+    var hora = document.getElementById("iHora").value;
+    var nota = document.getElementById("iNota").value.trim();
+    if (!cli || !id || !fech || !hora) { toast("⚠️ Completa todos los campos"); return; }
+    var c = null;
+    for (var i = 0; i < D.lista.length; i++) {
+      if (String(D.lista[i].id) === String(id)) { c = D.lista[i]; break; }
+    }
+    var pago = pagoActual === "yape" ? "Yape 💜" : "Efectivo 💵";
+    var f    = new Date(fech + "T00:00:00");
+    var fb   = f.toLocaleDateString("es-PE", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+    var msg  = "💈 *NUEVA RESERVA - " + D.cfg.neg + "* 💈\n━━━━━━━━━━━━━━━━\n" +
+      "👤 *Cliente:* " + cli + "\n✂️ *Servicio:* " + c.n + "\n💰 *Precio:* S/ " + Number(c.p).toFixed(2) +
+      "\n📅 *Fecha:* " + fb + "\n🕐 *Hora:* " + hora + "\n💳 *Pago:* " + pago +
+      (nota ? "\n📝 *Nota:* " + nota : "") + "\n━━━━━━━━━━━━━━━━\n_Reserva enviada desde la web_";
+    window.open("https://wa.me/" + D.cfg.wa + "?text=" + encodeURIComponent(msg), "_blank");
+    toast("📲 Abriendo WhatsApp...");
+  }
+  window.enviarWA = enviarWA;
+  window.calcTotal = calcTotal;
+
+  /* ── HELPERS ── */
+  function xss(s)  { return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function xssQ(s) { return String(s || "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+  function toast(msg) {
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(t._t);
+    t._t = setTimeout(function() { t.classList.remove("show"); }, 3000);
+  }
+
+  /* ── INICIO ── */
   renderCortes();
   renderSelect();
   aplicarTextos();
   aplicarQRs();
-  cerrarAj();
-  toast("✅ Cambios guardados");
-}
-
-/* Quitar fotos */
-function quitarYp() {
-  D.cfg.imgYp = null;
-  document.getElementById("minYp").style.display = "none";
-  document.getElementById("btnQYp").style.display = "none";
-  guardar(); aplicarQRs();
-  toast("✅ Foto Yape quitada");
-}
-function quitarLo() {
-  D.cfg.imgLo = null;
-  document.getElementById("minLo").style.display = "none";
-  document.getElementById("btnQLo").style.display = "none";
-  guardar(); aplicarQRs();
-  toast("✅ Foto Ubicación quitada");
-}
-
-/* ── SUBIR FOTOS ── */
-document.getElementById("btnSubYp").addEventListener("click", function(){ elegirFoto("yape"); });
-document.getElementById("btnSubLo").addEventListener("click", function(){ elegirFoto("local"); });
-document.getElementById("pinYape").addEventListener("click",  function(){ if(isOwner) elegirFoto("yape"); });
-document.getElementById("pinLocal").addEventListener("click", function(){ if(isOwner) elegirFoto("local"); });
-
-/* Delegación de eventos para los pines de los cortes */
-document.getElementById("gridCortes").addEventListener("click", function(e) {
-  var btn = e.target.closest("[data-accion]");
-  if (!btn) return;
-  var accion = btn.getAttribute("data-accion");
-  var id = parseInt(btn.getAttribute("data-id"));
-  if (accion === "foto-corte" && isOwner) { elegirFoto("corte", id); }
-  if (accion === "reservar") { reservarCorte(id); }
-});
-
-function elegirFoto(tipo, id) {
-  fotoTarget = {tipo: tipo, id: id || null};
-  var inp = document.getElementById("fileFoto");
-  inp.value = "";
-  inp.click();
-}
-
-document.getElementById("fileFoto").addEventListener("change", function(e) {
-  var file = e.target.files && e.target.files[0];
-  if (!file || !fotoTarget) return;
-  if (!file.type.startsWith("image/")) { toast("⚠️ Elige una imagen"); return; }
-  toast("⏳ Procesando...");
-  var maxW = fotoTarget.tipo === "corte" ? 700 : 450;
-  redim(file, maxW, function(dataUrl) {
-    if (fotoTarget.tipo === "corte") {
-      for (var i = 0; i < D.lista.length; i++) {
-        if (D.lista[i].id === fotoTarget.id) { D.lista[i].img = dataUrl; break; }
-      }
-      guardar(); renderCortes();
-    } else if (fotoTarget.tipo === "yape") {
-      D.cfg.imgYp = dataUrl;
-      var m = document.getElementById("minYp");
-      m.src = dataUrl; m.style.display = "block";
-      document.getElementById("btnQYp").style.display = "block";
-      guardar(); aplicarQRs();
-    } else if (fotoTarget.tipo === "local") {
-      D.cfg.imgLo = dataUrl;
-      var m = document.getElementById("minLo");
-      m.src = dataUrl; m.style.display = "block";
-      document.getElementById("btnQLo").style.display = "block";
-      guardar(); aplicarQRs();
-    }
-    toast("✅ Foto actualizada");
-    fotoTarget = null;
-  });
-});
-
-function redim(file, maxW, cb) {
-  var r = new FileReader();
-  r.onload = function(e) {
-    var img = new Image();
-    img.onload = function() {
-      var w = img.width, h = img.height;
-      if (w > maxW) { h = Math.round(h * (maxW / w)); w = maxW; }
-      var cv = document.createElement("canvas");
-      cv.width = w; cv.height = h;
-      cv.getContext("2d").drawImage(img, 0, 0, w, h);
-      cb(cv.toDataURL("image/jpeg", 0.82));
-    };
-    img.onerror = function(){ toast("⚠️ No se pudo leer la imagen"); };
-    img.src = e.target.result;
-  };
-  r.onerror = function(){ toast("⚠️ Error al leer el archivo"); };
-  r.readAsDataURL(file);
-}
-
-/* ── COPIAR / DESCARGAR HTML (cierra modo dueño antes) ── */
-function obtenerHTMLLimpio() {
-  salir();           // cierra modo dueño en el DOM
-  guardar();         // graba datos actualizados en el <script id="SD">
-  return "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
-}
-
-function copiarHTML() {
-  var codigo = obtenerHTMLLimpio();
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(codigo).then(function(){
-      toast("📋 ¡Código copiado! Pégalo en GitHub");
-    }).catch(function(){ copiarFallback(codigo); });
-  } else {
-    copiarFallback(codigo);
-  }
-}
-
-function copiarFallback(codigo) {
-  var ta = document.createElement("textarea");
-  ta.value = codigo;
-  ta.style.cssText = "position:fixed;opacity:0;top:0;left:0;";
-  document.body.appendChild(ta);
-  ta.select(); ta.setSelectionRange(0, 999999);
-  try {
-    document.execCommand("copy");
-    toast("📋 ¡Código copiado! Pégalo en GitHub");
-  } catch(e) {
-    toast("⚠️ No se pudo copiar automáticamente");
-  }
-  document.body.removeChild(ta);
-}
-
-function descargarHTML() {
-  var codigo = obtenerHTMLLimpio();
-  var blob = new Blob([codigo], {type:"text/html"});
-  var url  = URL.createObjectURL(blob);
-  var a    = document.createElement("a");
-  a.href = url; a.download = "index.html";
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  toast("⬇️ Descargando index.html...");
-}
-
-/* ── RESERVA ── */
-function reservarCorte(id) {
-  document.getElementById("iSrv").value = id;
+  document.getElementById("iFech").min = new Date().toISOString().split("T")[0];
   calcTotal();
-  document.getElementById("reservar").scrollIntoView({behavior:"smooth"});
-}
-
-function calcTotal() {
-  var id = document.getElementById("iSrv").value;
-  var c = null;
-  for (var i = 0; i < D.lista.length; i++) {
-    if (String(D.lista[i].id) === String(id)) { c = D.lista[i]; break; }
-  }
-  document.getElementById("iTotal").textContent = c ? "S/ "+Number(c.p).toFixed(2) : "S/ 0.00";
-}
-
-function setPago(m) {
-  pagoActual = m;
-  document.getElementById("pYape").classList.toggle("activo", m === "yape");
-  document.getElementById("pEfect").classList.toggle("activo", m === "efect");
-  document.getElementById("panelYape").style.display = m === "yape" ? "block" : "none";
-}
-
-function enviarWA() {
-  var cli  = document.getElementById("iCli").value.trim();
-  var id   = document.getElementById("iSrv").value;
-  var fech = document.getElementById("iFech").value;
-  var hora = document.getElementById("iHora").value;
-  var nota = document.getElementById("iNota").value.trim();
-  if (!cli||!id||!fech||!hora) { toast("⚠️ Completa todos los campos"); return; }
-  var c = null;
-  for (var i = 0; i < D.lista.length; i++) {
-    if (String(D.lista[i].id) === String(id)) { c = D.lista[i]; break; }
-  }
-  var pago = pagoActual === "yape" ? "Yape 💜" : "Efectivo 💵";
-  var f  = new Date(fech+"T00:00:00");
-  var fb = f.toLocaleDateString("es-PE",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
-  var msg = "💈 *NUEVA RESERVA - "+D.cfg.neg+"* 💈\n━━━━━━━━━━━━━━━━\n"+
-    "👤 *Cliente:* "+cli+"\n✂️ *Servicio:* "+c.n+"\n💰 *Precio:* S/ "+Number(c.p).toFixed(2)+
-    "\n📅 *Fecha:* "+fb+"\n🕐 *Hora:* "+hora+"\n💳 *Pago:* "+pago+
-    (nota?"\n📝 *Nota:* "+nota:"")+"\n━━━━━━━━━━━━━━━━\n_Reserva enviada desde la web_";
-  window.open("https://wa.me/"+D.cfg.wa+"?text="+encodeURIComponent(msg),"_blank");
-  toast("📲 Abriendo WhatsApp...");
-}
-
-/* ── HELPERS ── */
-function esc(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function escH(s){ return String(s||"").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-
-function toast(msg) {
-  var t = document.getElementById("toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  clearTimeout(t._t);
-  t._t = setTimeout(function(){ t.classList.remove("show"); }, 3000);
-}
-
-/* ── INICIO ── */
-renderCortes();
-renderSelect();
-aplicarTextos();
-aplicarQRs();
-document.getElementById("iFech").min = new Date().toISOString().split("T")[0];
-calcTotal();
 
 }); /* fin DOMContentLoaded */
 </script>
-</body>
-</html>
+
+
+</body></html>
