@@ -1,551 +1,6 @@
 <!DOCTYPE html>
-<html lang="es"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        const RealURL = URL;
-        const realDecodeURIComponent = decodeURIComponent;
-        const RealTextEncoder = TextEncoder;
-        const realAtob = atob;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
-        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
-        let storageReadsOut = 0;
-        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-              storageReadsOut += 1;
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-              storageReadsOut += 1;
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
-              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
-              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                ...(rootElement.offsetHeight > previewHeight && {
-                  height: previewHeight,
-                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
-                }),
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            storageReadsOut -= 1;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            storageReadsOut -= 1;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
-        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
-        const resolvedHref = (linkEl) => {
-          if (typeof linkEl.href === "string") return linkEl.href;
-          const written = linkEl.href?.baseVal;
-          // A same-document SVG link, such as one that begins an animation, stays with the browser.
-          if (!written || written.trim().startsWith("#")) return "";
-          try {
-            return new RealURL(written, linkEl.baseURI).href;
-          } catch (error) {
-            return written;
-          }
-        };
-
-        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
-        // page and would load that page in the frame instead of scrolling.
-        const sameDocumentFragment = (linkEl) => {
-          const written = linkEl.getAttribute("href")?.trim();
-          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
-          return written.slice(1);
-        };
-
-        const scrollToFragment = (fragment) => {
-          let decoded = fragment;
-          try {
-            decoded = realDecodeURIComponent(fragment);
-          } catch (error) {}
-          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
-          for (const named of target ? [] : document.getElementsByName(decoded)) {
-            if (named.localName === "a") {
-              target = named;
-              break;
-            }
-          }
-          if (target) {
-            target.scrollIntoView();
-          } else if (decoded.toLowerCase() === "top") {
-            window.scrollTo(0, 0);
-          } else {
-            return false;
-          }
-          return true;
-        };
-
-        // Same decoder as dataUrlFile in app/page.tsx; change both together.
-        const hexPair = /^[0-9a-f]{2}$/i;
-        const dataUrlFile = (href) => {
-          const hash = href.indexOf("#");
-          const url = hash === -1 ? href : href.slice(0, hash);
-          const comma = url.indexOf(",");
-          if (comma === -1) return null;
-          const header = url.slice(0, comma);
-          const payload = url.slice(comma + 1);
-          const mimeMatch = header.match(/data:([^;]+)/);
-          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-          const declaredBase64 = header
-            .split(";")
-            .slice(1)
-            .some((param) => param.trim().toLowerCase() === "base64");
-          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
-          const binaryType = type !== "" && !type.startsWith("text/");
-          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
-            let binary = null;
-            try {
-              binary = realAtob(
-                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
-              );
-            } catch (error) {
-              if (declaredBase64) return null;
-            }
-            if (binary !== null) {
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                bytes[i] = binary.charCodeAt(i);
-              }
-              return { mimeType, data: bytes.buffer };
-            }
-          }
-          const input = new RealTextEncoder().encode(payload);
-          const bytes = new Uint8Array(input.length);
-          let length = 0;
-          for (let i = 0; i < input.length; i++) {
-            if (input[i] === 0x25 && i + 2 < input.length) {
-              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
-              if (hexPair.test(pair)) {
-                bytes[length++] = parseInt(pair, 16);
-                i += 2;
-                continue;
-              }
-            }
-            bytes[length++] = input[i];
-          }
-          return { mimeType, data: bytes.slice(0, length).buffer };
-        };
-
-        const onLinkClick = (event) => {
-          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
-          if (typeof event.target?.closest !== "function") return;
-    
-          const linkEl = event.target.closest("a");
-          const href = linkEl && resolvedHref(linkEl);
-          if (!href) return;
-
-          const fragment = sameDocumentFragment(linkEl);
-          if (fragment !== null) {
-            const handledByArtifact = event.defaultPrevented;
-            event.preventDefault();
-            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
-            // A fragment that names nothing in the artifact may name something in the host,
-            // such as a project thread. The artifact's own listeners still see the click.
-            realParent.postMessage({ type: 'openExternal', href }, '*');
-            return;
-          }
-          const filename = linkEl.getAttribute("download") ?? "";
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (href.startsWith("data:")) {
-            const file = dataUrlFile(href);
-            if (!file) return;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename,
-              data: file.data,
-              mimeType: file.mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href,
-            }, '*');
-          }
-        };
-        window.addEventListener('click', onLinkClick);
-
-        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
-        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
-        const RealAnchor = window.HTMLAnchorElement;
-        const RealMouseEvent = window.MouseEvent;
-        const anchorProto = RealAnchor?.prototype;
-        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
-        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
-          const onMissedClick = (event) => {
-            if (!event.defaultPrevented) onLinkClick(event);
-          };
-          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
-          const listening = new WeakSet();
-          const callHearingMissed = (anchor, bubbles, call) => {
-            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
-              return call();
-            }
-            listening.add(anchor);
-            anchor.addEventListener('click', onMissedClick);
-            try {
-              return call();
-            } finally {
-              listening.delete(anchor);
-              anchor.removeEventListener('click', onMissedClick);
-            }
-          };
-          anchorProto.click = function () {
-            return callHearingMissed(this, true, () => superProto.click.call(this));
-          };
-          anchorProto.dispatchEvent = function (event) {
-            const call = () => superProto.dispatchEvent.call(this, event);
-            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
-          };
-        }
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-
-        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
-        (() => {
-          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
-          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
-        })();
-      })();
-    </script>
-  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
+<html lang="es">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Style Modern | Barbería SJL - Lima</title>
@@ -734,7 +189,7 @@ body.md .pin{display:flex;}
 .bguar:hover{opacity:.88;}
 </style>
 </head>
-<body id="artifacts-component-root-html" class="">
+<body>
 
 <div class="fondo"></div>
 <div class="poste"></div>
@@ -779,7 +234,7 @@ body.md .pin{display:flex;}
     <div class="asec">
       <h4>💜 Foto QR de Yape</h4>
       <div class="afila">
-        <img id="minYp" class="mini" style="display: none;">
+        <img id="minYp" class="mini">
         <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
           <button class="bfoto" onclick="elegirFoto('yape')">📷 Subir foto Yape</button>
           <button class="bfoto" id="btnQYp" style="display:none;" onclick="quitarYape()">🗑️ Quitar foto</button>
@@ -790,7 +245,7 @@ body.md .pin{display:flex;}
     <div class="asec">
       <h4>📍 Foto QR de Ubicación</h4>
       <div class="afila">
-        <img id="minLo" class="mini" style="display: none;">
+        <img id="minLo" class="mini">
         <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
           <button class="bfoto" onclick="elegirFoto('local')">📷 Subir foto Ubicación</button>
           <button class="bfoto" id="btnQLo" style="display:none;" onclick="quitarLocal()">🗑️ Quitar foto</button>
@@ -800,7 +255,7 @@ body.md .pin{display:flex;}
 
     <div class="asec">
       <h4>✂️ Cortes (nombre, descripción y precio)</h4>
-      <div id="ajCortes"><div class="cbloque"><div class="ct">✂️ Corte #1</div><label class="cl">Nombre</label><input type="text" id="an1" value="Fade Clásico"><label class="cl">Descripción</label><input type="text" id="ad1" value="Degradado limpio y moderno, ideal para todo estilo."><label class="cl">Precio (S/)</label><input type="number" id="ap1" min="1" step="1" value="15"></div><div class="cbloque"><div class="ct">✂️ Corte #2</div><label class="cl">Nombre</label><input type="text" id="an2" value="Corte Texturizado"><label class="cl">Descripción</label><input type="text" id="ad2" value="Textura en la parte superior, muy juvenil y actual."><label class="cl">Precio (S/)</label><input type="number" id="ap2" min="1" step="1" value="18"></div><div class="cbloque"><div class="ct">✂️ Corte #3</div><label class="cl">Nombre</label><input type="text" id="an3" value="Mullet Moderno"><label class="cl">Descripción</label><input type="text" id="ad3" value="Estilo retro-vanguardia, tendencia entre jóvenes."><label class="cl">Precio (S/)</label><input type="number" id="ap3" min="1" step="1" value="20"></div><div class="cbloque"><div class="ct">✂️ Corte #4</div><label class="cl">Nombre</label><input type="text" id="an4" value="Buzz Cut / Rapado"><label class="cl">Descripción</label><input type="text" id="ad4" value="Corte al ras, rápido y de bajo mantenimiento."><label class="cl">Precio (S/)</label><input type="number" id="ap4" min="1" step="1" value="12"></div><div class="cbloque"><div class="ct">✂️ Corte #5</div><label class="cl">Nombre</label><input type="text" id="an5" value="Pompadour Clásico"><label class="cl">Descripción</label><input type="text" id="ad5" value="Elegancia para adultos, ideal para oficina."><label class="cl">Precio (S/)</label><input type="number" id="ap5" min="1" step="1" value="80"></div><div class="cbloque"><div class="ct">✂️ Corte #6</div><label class="cl">Nombre</label><input type="text" id="an6" value="Corte con Diseño"><label class="cl">Descripción</label><input type="text" id="ad6" value="Líneas y diseños personalizados, tu estilo único."><label class="cl">Precio (S/)</label><input type="number" id="ap6" min="1" step="1" value="80"></div><div class="cbloque"><div class="ct">✂️ Corte #7</div><label class="cl">Nombre</label><input type="text" id="an7" value="Barba + Corte"><label class="cl">Descripción</label><input type="text" id="ad7" value="Servicio completo: corte moderno + perfilado de barba."><label class="cl">Precio (S/)</label><input type="number" id="ap7" min="1" step="1" value="29"></div><div class="cbloque"><div class="ct">✂️ Corte #8</div><label class="cl">Nombre</label><input type="text" id="an8" value="Corte Niños"><label class="cl">Descripción</label><input type="text" id="ad8" value="Paciencia y estilo para los más pequeños."><label class="cl">Precio (S/)</label><input type="number" id="ap8" min="1" step="1" value="80"></div></div>
+      <div id="ajCortes"></div>
     </div>
 
     <div style="display:flex;gap:9px;margin-top:6px;">
@@ -835,7 +290,7 @@ body.md .pin{display:flex;}
 <section id="cortes">
   <h2 class="sec-t">Nuestros <b>Cortes</b></h2>
   <p class="sec-s">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
-  <div class="grid" id="gridCortes"><div class="card"><button class="pin" onclick="elegirFoto('corte',1)">✏️</button><img src="https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&amp;q=80" alt="Fade Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Fade Clásico</h3><p class="desc">Degradado limpio y moderno, ideal para todo estilo.</p><div class="precio">30.00</div><button class="btn" onclick="reservarCorte(1)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',2)">✏️</button><img src="https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&amp;q=80" alt="Corte Texturizado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte Texturizado</h3><p class="desc">Textura en la parte superior, muy juvenil y actual.</p><div class="precio">60.00</div><button class="btn" onclick="reservarCorte(2)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',3)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Mullet Moderno" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Mullet Moderno</h3><p class="desc">Estilo retro-vanguardia, tendencia entre jóvenes.</p><div class="precio">60.00</div><button class="btn" onclick="reservarCorte(3)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',4)">✏️</button><img src="https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&amp;q=80" alt="Buzz Cut / Rapado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Buzz Cut / Rapado</h3><p class="desc">Corte al ras, rápido y de bajo mantenimiento.</p><div class="precio">12.00</div><button class="btn" onclick="reservarCorte(4)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',5)">✏️</button><img src="https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&amp;q=80" alt="Pompadour Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Pompadour Clásico</h3><p class="desc">Elegancia para adultos, ideal para oficina.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(5)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',6)">✏️</button><img src="https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&amp;q=80" alt="Corte con Diseño" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte con Diseño</h3><p class="desc">Líneas y diseños personalizados, tu estilo único.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(6)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',7)">✏️</button><img src="https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&amp;q=80" alt="Barba + Corte" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Barba + Corte</h3><p class="desc">Servicio completo: corte moderno + perfilado de barba.</p><div class="precio">29.00</div><button class="btn" onclick="reservarCorte(7)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',8)">✏️</button><img src="https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&amp;q=80" alt="Corte Niños" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte Niños</h3><p class="desc">Paciencia y estilo para los más pequeños.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(8)">Reservar este corte</button></div></div></div>
+  <div class="grid" id="gridCortes"></div>
 </section>
 
 <!-- RESERVA -->
@@ -844,9 +299,9 @@ body.md .pin{display:flex;}
   <p class="sec-s">Completa tus datos y envía tu reserva por WhatsApp</p>
   <div class="res-box">
     <div class="fg"><label>Nombre completo</label><input type="text" id="iCliente" placeholder="Ej: Juan Pérez"></div>
-    <div class="fg"><label>Servicio / Corte</label><select id="iServicio" onchange="calcTotal()"><option value="">-- Selecciona un corte --</option><option value="1">Fade Clásico — S/ 30.00</option><option value="2">Corte Texturizado — S/ 60.00</option><option value="3">Mullet Moderno — S/ 60.00</option><option value="4">Buzz Cut / Rapado — S/ 12.00</option><option value="5">Pompadour Clásico — S/ 80.00</option><option value="6">Corte con Diseño — S/ 80.00</option><option value="7">Barba + Corte — S/ 29.00</option><option value="8">Corte Niños — S/ 80.00</option></select></div>
+    <div class="fg"><label>Servicio / Corte</label><select id="iServicio" onchange="calcTotal()"></select></div>
     <div class="fg2">
-      <div class="fg"><label>Fecha</label><input type="date" id="iFecha" min="2026-11-08"></div>
+      <div class="fg"><label>Fecha</label><input type="date" id="iFecha"></div>
       <div class="fg">
         <label>Hora</label>
         <select id="iHora">
@@ -870,7 +325,7 @@ body.md .pin{display:flex;}
     <div id="panelYape" style="text-align:center;margin-top:16px;">
       <div class="qr-box">
         <button class="pin" onclick="elegirFoto('yape')">✏️</button>
-        <img id="imgYape" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=YAPE-STYLEMODERN-999888777" alt="QR Yape">
+        <img id="imgYape" src="" alt="QR Yape">
         <div class="qr-info">Escanea con Yape · <b>Style Modern</b></div>
       </div>
       <p style="font-size:.78rem;color:#aaa;margin-top:7px;">
@@ -888,7 +343,7 @@ body.md .pin{display:flex;}
   <div class="qr-wrap">
     <div class="qr-box">
       <button class="pin" onclick="elegirFoto('local')">✏️</button>
-      <img id="imgLocal" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https%3A%2F%2Fmaps.google.com%2F%3Fq%3DAv.%20Principal%20SJL%2C%20Lima%20San%20Juan%20de%20Lurigancho%20%C2%B7%20Lima%2C%20Per%C3%BA" alt="QR Ubicación">
+      <img id="imgLocal" src="" alt="QR Ubicación">
       <div class="qr-info">Style Modern · San Juan de Lurigancho</div>
     </div>
     <p style="color:#aaa;font-size:.88rem;margin-top:12px;">
@@ -902,19 +357,19 @@ body.md .pin{display:flex;}
   <div style="font-size:1.4rem;margin-bottom:9px;">💈 <b>STYLE MODERN</b> 💈</div>
   <div class="foot-info">
     📍 <span id="tDirF">San Juan de Lurigancho · Lima, Perú</span><br>
-    📞 WhatsApp: <b id="tWaF">+51999888777</b><br>
-    🕐 <span id="tHorF">Lun a Dom: 9:00 am - 8:00 pm</span><br>
+    📞 WhatsApp: <b id="tWaF">+51 999 888 777</b><br>
+    🕐 <span id="tHorF">Lunes a Domingo · 9:00 am - 8:00 pm</span><br>
     💳 Aceptamos Yape · Efectivo
   </div>
   <p style="margin-top:18px;color:#555;font-size:.73rem;">© 2025 Style Modern Barbería · Todos los derechos reservados</p>
 </footer>
 
-<a class="wa" id="linkWA" href="https://wa.me/51999888777?text=Hola%2C%20quiero%20informaci%C3%B3n%20sobre%20los%20cortes%20%F0%9F%92%88" target="_blank">💬</a>
-<div class="toast show" id="toast">🔒 Modo Dueño desactivado</div>
+<a class="wa" id="linkWA" href="#" target="_blank">💬</a>
+<div class="toast" id="toast"></div>
 <input type="file" id="fileFoto" accept="image/*" style="display:none;">
 
 <!-- DATOS DEL SITIO (se actualizan al guardar en Modo Dueño) -->
-<script type="application/json" id="SD">{"cfg":{"wa":"51999888777","neg":"Style Modern","yp":"999 888 777","dir":"Av. Principal SJL, Lima","hor":"Lun a Dom: 9:00 am - 8:00 pm","horF":"Lun a Dom: 9:00 am - 8:00 pm","ubic":"San Juan de Lurigancho · Lima, Perú","imgYp":null,"imgLo":null},"lista":[{"id":1,"n":"Fade Clásico","d":"Degradado limpio y moderno, ideal para todo estilo.","p":30,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"n":"Corte Texturizado","d":"Textura en la parte superior, muy juvenil y actual.","p":60,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"n":"Mullet Moderno","d":"Estilo retro-vanguardia, tendencia entre jóvenes.","p":60,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":4,"n":"Buzz Cut / Rapado","d":"Corte al ras, rápido y de bajo mantenimiento.","p":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"n":"Pompadour Clásico","d":"Elegancia para adultos, ideal para oficina.","p":80,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"n":"Corte con Diseño","d":"Líneas y diseños personalizados, tu estilo único.","p":80,"img":"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},{"id":7,"n":"Barba + Corte","d":"Servicio completo: corte moderno + perfilado de barba.","p":29,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"n":"Corte Niños","d":"Paciencia y estilo para los más pequeños.","p":80,"img":"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}]}</script>
+<script type="application/json" id="SD">{"cfg":{"wa":"51999888777","neg":"Style Modern","yp":"999 888 777","dir":"Av. Principal SJL, Lima","hor":"Lun a Dom: 9:00 am - 8:00 pm","horF":"Lunes a Domingo \u00b7 9:00 am - 8:00 pm","ubic":"San Juan de Lurigancho \u00b7 Lima, Per\u00fa","imgYp":null,"imgLo":null},"lista":[{"id":1,"n":"Fade Cl\u00e1sico","d":"Degradado limpio y moderno, ideal para todo estilo.","p":15,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"n":"Corte Texturizado","d":"Textura en la parte superior, muy juvenil y actual.","p":18,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"n":"Mullet Moderno","d":"Estilo retro-vanguardia, tendencia entre j\u00f3venes.","p":20,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":4,"n":"Buzz Cut \/ Rapado","d":"Corte al ras, r\u00e1pido y de bajo mantenimiento.","p":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"n":"Pompadour Cl\u00e1sico","d":"Elegancia para adultos, ideal para oficina.","p":22,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"n":"Corte con Dise\u00f1o","d":"L\u00edneas y dise\u00f1os personalizados, tu estilo \u00fanico.","p":25,"img":"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},{"id":7,"n":"Barba + Corte","d":"Servicio completo: corte moderno + perfilado de barba.","p":28,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"n":"Corte Ni\u00f1os","d":"Paciencia y estilo para los m\u00e1s peque\u00f1os.","p":12,"img":"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}]}</script>
 
 <script>
 /* ── CARGA DE DATOS ── */
@@ -1295,7 +750,5 @@ window.addEventListener("DOMContentLoaded", function(){
   calcTotal();
 });
 </script>
-
-
-
-</body></html>
+</body>
+</html>
