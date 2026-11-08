@@ -1,675 +1,855 @@
 <!DOCTYPE html>
 <html lang="es"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="Style Modern - Barbería en San Juan de Lurigancho, Lima. Cortes actuales para jóvenes y adultos. Reserva por WhatsApp y paga con Yape.">
 <title>Style Modern | Barbería SJL - Lima</title>
 <style>
-  /* ====== CONFIGURACIÓN GLOBAL ====== */
-  :root{
-    --dorado: #d4af37;
-    --negro: #0d0d0d;
-    --gris: #1a1a1a;
-    --gris-claro: #242424;
-    --texto: #f5f5f5;
-    --whatsapp: #25D366;
-    --yape: #6f2c91;
-  }
-  *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif;}
-  html{scroll-behavior:smooth;}
-  body{
-    background:var(--negro);
-    color:var(--texto);
-    overflow-x:hidden;
-    min-height:100vh;
-  }
+:root{
+  --d:#d4af37;--ng:#0d0d0d;--g1:#1a1a1a;--g2:#242424;
+  --tx:#f5f5f5;--wa:#25D366;--yp:#6f2c91;
+}
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif;}
+html{scroll-behavior:smooth;}
+body{background:var(--ng);color:var(--tx);overflow-x:hidden;min-height:100vh;}
 
-  /* ====== FONDO ANIMADO BARBERÍA ====== */
-  .fondo-animado{
-    position:fixed;
-    top:0;left:0;
-    width:100%;height:100%;
-    z-index:-2;
-    background:
-      radial-gradient(circle at 20% 30%, rgba(212,175,55,.12), transparent 40%),
-      radial-gradient(circle at 80% 70%, rgba(212,175,55,.10), transparent 40%),
-      linear-gradient(180deg,#0d0d0d 0%,#141414 50%,#0d0d0d 100%);
-  }
-  .poste{
-    position:fixed;
-    top:0;left:0;
-    width:100%;height:100%;
-    z-index:-1;
-    opacity:.06;
-    background-image:repeating-linear-gradient(
-      -45deg,
-      #d4af37 0 40px,
-      transparent 40px 80px,
-      #b01010 80px 120px,
-      transparent 120px 160px
-    );
-    animation:girar 12s linear infinite;
-  }
-  @keyframes girar{
-    from{background-position:0 0;}
-    to{background-position:400px 400px;}
-  }
-  .flotantes{
-    position:fixed;
-    inset:0;
-    z-index:-1;
-    pointer-events:none;
-    overflow:hidden;
-    font-size:2.2rem;
-    opacity:.08;
-  }
-  .flotantes span{
-    position:absolute;
-    animation:flotar 18s linear infinite;
-  }
-  .flotantes span:nth-child(1){left:5%;animation-delay:0s;}
-  .flotantes span:nth-child(2){left:25%;animation-delay:3s;}
-  .flotantes span:nth-child(3){left:50%;animation-delay:6s;}
-  .flotantes span:nth-child(4){left:72%;animation-delay:2s;}
-  .flotantes span:nth-child(5){left:90%;animation-delay:8s;}
-  @keyframes flotar{
-    0%{transform:translateY(110vh) rotate(0deg);}
-    100%{transform:translateY(-20vh) rotate(360deg);}
-  }
+/* FONDO */
+.fondo{position:fixed;inset:0;z-index:-2;
+  background:radial-gradient(circle at 20% 30%,rgba(212,175,55,.12),transparent 40%),
+  radial-gradient(circle at 80% 70%,rgba(212,175,55,.10),transparent 40%),
+  linear-gradient(180deg,#0d0d0d,#141414 50%,#0d0d0d);}
+.poste{position:fixed;inset:0;z-index:-1;opacity:.05;
+  background:repeating-linear-gradient(-45deg,#d4af37 0 40px,transparent 40px 80px,#b01010 80px 120px,transparent 120px 160px);
+  animation:gira 12s linear infinite;}
+@keyframes gira{from{background-position:0 0}to{background-position:400px 400px}}
+.floats{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;font-size:2rem;opacity:.07;}
+.floats span{position:absolute;animation:sube 18s linear infinite;}
+.floats span:nth-child(1){left:5%;animation-delay:0s}
+.floats span:nth-child(2){left:25%;animation-delay:3s}
+.floats span:nth-child(3){left:50%;animation-delay:7s}
+.floats span:nth-child(4){left:72%;animation-delay:2s}
+.floats span:nth-child(5){left:90%;animation-delay:9s}
+@keyframes sube{0%{transform:translateY(110vh) rotate(0)}100%{transform:translateY(-15vh) rotate(360deg)}}
 
-  /* ====== HEADER / NAV ====== */
-  header{
-    position:sticky;top:0;z-index:100;
-    background:rgba(13,13,13,.92);
-    backdrop-filter:blur(10px);
-    border-bottom:1px solid rgba(212,175,55,.3);
-    padding:12px 20px;
-    display:flex;align-items:center;justify-content:space-between;
-    flex-wrap:wrap;
-    gap:10px;
-  }
-  .logo{
-    display:flex;align-items:center;gap:10px;
-    font-weight:800;font-size:1.4rem;
-    letter-spacing:1px;
-  }
-  .logo .icono{
-    font-size:1.8rem;
-    filter:drop-shadow(0 0 6px var(--dorado));
-    animation:brillo 3s ease-in-out infinite;
-  }
-  @keyframes brillo{
-    0%,100%{filter:drop-shadow(0 0 4px var(--dorado));}
-    50%{filter:drop-shadow(0 0 14px var(--dorado));}
-  }
-  .logo span{color:var(--dorado);}
-  nav a{
-    color:var(--texto);
-    text-decoration:none;
-    margin:0 8px;
-    font-size:.9rem;
-    transition:.3s;
-    padding:6px 4px;
-  }
-  nav a:hover{color:var(--dorado);}
+/* HEADER */
+header{position:sticky;top:0;z-index:100;background:rgba(13,13,13,.93);backdrop-filter:blur(10px);
+  border-bottom:1px solid rgba(212,175,55,.3);padding:12px 20px;
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.3rem;
+  letter-spacing:1px;cursor:pointer;user-select:none;-webkit-user-select:none;}
+.logo em{font-style:normal;font-size:1.7rem;filter:drop-shadow(0 0 6px var(--d));animation:brilla 3s ease-in-out infinite;}
+@keyframes brilla{0%,100%{filter:drop-shadow(0 0 4px var(--d))}50%{filter:drop-shadow(0 0 14px var(--d))}}
+.logo b{color:var(--d);}
+nav a{color:var(--tx);text-decoration:none;margin:0 7px;font-size:.88rem;transition:.3s;}
+nav a:hover{color:var(--d);}
 
-  /* ====== HERO ====== */
-  .hero{
-    text-align:center;
-    padding:80px 20px 60px;
-    max-width:900px;
-    margin:0 auto;
-  }
-  .hero h1{
-    font-size:clamp(2rem,6vw,3.5rem);
-    margin-bottom:15px;
-    text-transform:uppercase;
-    line-height:1.1;
-  }
-  .hero h1 span{color:var(--dorado);}
-  .hero p{
-    color:#bbb;font-size:1.05rem;
-    max-width:600px;margin:0 auto 25px;
-    line-height:1.6;
-  }
-  .btn{
-    display:inline-block;
-    background:var(--dorado);
-    color:var(--negro);
-    font-weight:700;
-    padding:14px 30px;
-    border-radius:50px;
-    text-decoration:none;
-    border:none;
-    cursor:pointer;
-    font-size:1rem;
-    transition:.3s;
-    box-shadow:0 6px 20px rgba(212,175,55,.35);
-    font-family:inherit;
-  }
-  .btn:hover{transform:translateY(-3px);box-shadow:0 10px 28px rgba(212,175,55,.5);}
-  .btn-outline{
-    background:transparent;
-    color:var(--dorado);
-    border:2px solid var(--dorado);
-    box-shadow:none;
-    margin-left:10px;
-  }
-  .btn-outline:hover{background:var(--dorado);color:var(--negro);}
+/* HERO */
+.hero{text-align:center;padding:76px 20px 56px;max-width:860px;margin:0 auto;}
+.hero h1{font-size:clamp(1.9rem,6vw,3.4rem);margin-bottom:14px;text-transform:uppercase;line-height:1.1;}
+.hero h1 b{color:var(--d);}
+.hero p{color:#bbb;font-size:1rem;max-width:580px;margin:0 auto 24px;line-height:1.6;}
 
-  /* ====== SECCIONES ====== */
-  section{max-width:1100px;margin:0 auto;padding:60px 20px;}
-  .titulo-seccion{
-    text-align:center;
-    font-size:clamp(1.6rem,4vw,2.3rem);
-    margin-bottom:10px;
-  }
-  .titulo-seccion span{color:var(--dorado);}
-  .subtitulo{
-    text-align:center;color:#999;
-    margin-bottom:40px;font-size:.95rem;
-  }
+/* BOTONES */
+.btn{display:inline-block;background:var(--d);color:var(--ng);font-weight:700;padding:13px 28px;
+  border-radius:50px;text-decoration:none;border:none;cursor:pointer;font-size:.95rem;
+  transition:.3s;box-shadow:0 5px 18px rgba(212,175,55,.35);font-family:inherit;}
+.btn:hover{transform:translateY(-2px);box-shadow:0 9px 26px rgba(212,175,55,.5);}
+.btn-o{background:transparent;color:var(--d);border:2px solid var(--d);box-shadow:none;margin-left:9px;}
+.btn-o:hover{background:var(--d);color:var(--ng);}
 
-  /* ====== GRID DE CORTES ====== */
-  .grid-cortes{
-    display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
-    gap:22px;
-  }
-  .card{
-    background:linear-gradient(160deg,var(--gris),var(--gris-claro));
-    border:1px solid rgba(212,175,55,.25);
-    border-radius:16px;
-    overflow:hidden;
-    transition:.35s;
-    position:relative;
-    display:flex;
-    flex-direction:column;
-  }
-  .card:hover{
-    transform:translateY(-6px);
-    border-color:var(--dorado);
-    box-shadow:0 14px 30px rgba(212,175,55,.25);
-  }
-  .card img{
-    width:100%;height:180px;
-    object-fit:cover;
-    display:block;
-    filter:saturate(1.1);
-  }
-  .card-body{padding:16px 18px 20px;display:flex;flex-direction:column;flex:1;}
-  .card-body h3{
-    font-size:1.15rem;margin-bottom:6px;
-    color:var(--texto);
-  }
-  .card-body .desc{
-    font-size:.82rem;color:#aaa;
-    margin-bottom:14px;line-height:1.4;
-    min-height:36px;
-    flex:1;
-  }
-  .precio{
-    font-size:1.4rem;
-    font-weight:800;
-    color:var(--dorado);
-    margin-bottom:12px;
-  }
-  .precio::before{content:"S/ ";font-size:.9rem;}
-  .card .btn{width:100%;text-align:center;padding:11px;font-size:.9rem;}
+/* SECCIONES */
+section{max-width:1080px;margin:0 auto;padding:56px 20px;}
+.sec-t{text-align:center;font-size:clamp(1.5rem,4vw,2.2rem);margin-bottom:8px;}
+.sec-t b{color:var(--d);}
+.sec-s{text-align:center;color:#999;margin-bottom:36px;font-size:.93rem;}
 
-  /* ====== PANEL EDITOR DE PRECIOS ====== */
-  .editor{
-    background:rgba(212,175,55,.06);
-    border:1px dashed rgba(212,175,55,.5);
-    border-radius:14px;
-    padding:20px;
-    margin-top:40px;
-  }
-  .editor h3{color:var(--dorado);margin-bottom:12px;font-size:1rem;}
-  .editor p{font-size:.82rem;color:#aaa;margin-bottom:14px;}
-  .editor-fila{
-    display:flex;align-items:center;gap:10px;
-    margin-bottom:10px;flex-wrap:wrap;
-  }
-  .editor-fila label{flex:1;min-width:150px;font-size:.88rem;}
-  .editor-fila input{
-    width:110px;
-    background:#111;
-    border:1px solid rgba(212,175,55,.4);
-    color:var(--dorado);
-    font-weight:700;
-    padding:8px 10px;
-    border-radius:8px;
-    font-size:.95rem;
-  }
-  .editor-fila input:focus{outline:2px solid var(--dorado);}
-  .guardar{
-    background:var(--dorado);color:#000;
-    border:none;padding:10px 22px;border-radius:50px;
-    font-weight:700;cursor:pointer;margin-top:8px;
-    font-size:.9rem;
-    font-family:inherit;
-    transition:.25s;
-  }
-  .guardar:hover{transform:scale(1.05);}
+/* GRID */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:20px;}
+.card{background:linear-gradient(160deg,var(--g1),var(--g2));border:1px solid rgba(212,175,55,.22);
+  border-radius:15px;overflow:hidden;transition:.3s;position:relative;display:flex;flex-direction:column;}
+.card:hover{transform:translateY(-5px);border-color:var(--d);box-shadow:0 12px 28px rgba(212,175,55,.22);}
+.card img{width:100%;height:175px;object-fit:cover;display:block;}
+.card-body{padding:14px 16px 18px;display:flex;flex-direction:column;flex:1;}
+.card-body h3{font-size:1.1rem;margin-bottom:5px;}
+.card-body .desc{font-size:.8rem;color:#aaa;line-height:1.4;flex:1;margin-bottom:12px;}
+.precio{font-size:1.35rem;font-weight:800;color:var(--d);margin-bottom:11px;}
+.precio::before{content:"S/ ";font-size:.85rem;}
+.card .btn{width:100%;text-align:center;padding:10px;font-size:.88rem;}
 
-  /* ====== RESERVA ====== */
-  .reserva-box{
-    background:linear-gradient(160deg,var(--gris),var(--gris-claro));
-    border:1px solid rgba(212,175,55,.3);
-    border-radius:20px;
-    padding:30px;
-    max-width:650px;margin:0 auto;
-  }
-  .form-group{margin-bottom:16px;}
-  .form-group label{
-    display:block;font-size:.85rem;
-    margin-bottom:6px;color:var(--dorado);
-    font-weight:600;
-  }
-  .form-group input,
-  .form-group select,
-  .form-group textarea{
-    width:100%;
-    background:#111;
-    border:1px solid rgba(212,175,55,.35);
-    color:var(--texto);
-    padding:12px 14px;
-    border-radius:10px;
-    font-size:.95rem;
-    font-family:inherit;
-  }
-  .form-group input:focus,
-  .form-group select:focus{outline:2px solid var(--dorado);}
-  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
-  @media(max-width:520px){.form-grid{grid-template-columns:1fr;}}
+/* RESERVA */
+.res-box{background:linear-gradient(160deg,var(--g1),var(--g2));border:1px solid rgba(212,175,55,.28);
+  border-radius:18px;padding:28px;max-width:620px;margin:0 auto;}
+.fg{margin-bottom:14px;}
+.fg label{display:block;font-size:.83rem;margin-bottom:5px;color:var(--d);font-weight:600;}
+.fg input,.fg select{width:100%;background:#111;border:1px solid rgba(212,175,55,.32);
+  color:var(--tx);padding:11px 13px;border-radius:9px;font-size:.93rem;font-family:inherit;}
+.fg input:focus,.fg select:focus{outline:2px solid var(--d);}
+.fg2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+@media(max-width:500px){.fg2{grid-template-columns:1fr}}
+.total{background:rgba(212,175,55,.09);border:1px solid rgba(212,175,55,.38);border-radius:9px;
+  padding:13px 16px;margin:16px 0;display:flex;justify-content:space-between;align-items:center;font-weight:700;}
+.total span:last-child{color:var(--d);font-size:1.25rem;}
+.pagos{display:flex;gap:11px;margin-top:9px;flex-wrap:wrap;}
+.pago{flex:1;min-width:110px;padding:13px;border-radius:11px;border:2px solid #333;background:#111;
+  color:#ccc;cursor:pointer;text-align:center;font-weight:600;font-size:.83rem;transition:.22s;user-select:none;}
+.pago.activo{border-color:var(--yp);background:rgba(111,44,145,.2);color:#fff;}
+.pago.efect.activo{border-color:var(--d);background:rgba(212,175,55,.14);}
 
-  .total-box{
-    background:rgba(212,175,55,.1);
-    border:1px solid rgba(212,175,55,.4);
-    border-radius:10px;
-    padding:14px 18px;
-    margin:18px 0;
-    display:flex;justify-content:space-between;align-items:center;
-    font-weight:700;
-  }
-  .total-box span:last-child{color:var(--dorado);font-size:1.3rem;}
+/* QR */
+.qr-wrap{text-align:center;}
+.qr-box{display:inline-block;background:#fff;padding:16px;border-radius:13px;position:relative;margin:9px auto;}
+.qr-box img{width:185px;height:185px;display:block;object-fit:contain;}
+.qr-info{font-size:.78rem;color:#666;margin-top:7px;font-weight:600;}
 
-  .metodos-pago{
-    display:flex;gap:12px;margin-top:10px;flex-wrap:wrap;
-  }
-  .metodo{
-    flex:1;min-width:120px;
-    padding:14px;
-    border-radius:12px;
-    border:2px solid #333;
-    background:#111;
-    color:#ccc;
-    cursor:pointer;
-    text-align:center;
-    font-weight:600;font-size:.85rem;
-    transition:.25s;
-    user-select:none;
-  }
-  .metodo.activo{border-color:var(--yape);background:rgba(111,44,145,.2);color:#fff;}
-  .metodo.efectivo{border-color:#555;}
-  .metodo.efectivo.activo{border-color:var(--dorado);background:rgba(212,175,55,.15);}
+/* FOOTER */
+footer{text-align:center;padding:38px 20px;border-top:1px solid rgba(212,175,55,.18);color:#888;font-size:.83rem;margin-top:36px;}
+footer b{color:var(--d);}
+.foot-info{margin-top:11px;line-height:1.9;}
 
-  /* ====== QR ====== */
-  .qr-box{
-    text-align:center;
-    background:#fff;
-    padding:18px;
-    border-radius:14px;
-    display:inline-block;
-    margin:10px auto;
-    position:relative;
-  }
-  .qr-box .edit-pin{top:6px;right:6px;width:30px;height:30px;font-size:.9rem;}
-  .qr-box img{width:190px;height:190px;display:block;margin:0 auto;}
-  .qr-info{font-size:.8rem;color:#666;margin-top:8px;font-weight:600;}
+/* WA */
+.wa{position:fixed;bottom:20px;right:20px;width:58px;height:58px;background:var(--wa);border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:1.8rem;
+  box-shadow:0 5px 18px rgba(37,211,102,.48);z-index:200;text-decoration:none;animation:pulsa 2s infinite;}
+@keyframes pulsa{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
 
-  /* ====== FOOTER ====== */
-  footer{
-    text-align:center;
-    padding:40px 20px;
-    border-top:1px solid rgba(212,175,55,.2);
-    color:#888;font-size:.85rem;
-    margin-top:40px;
-  }
-  footer strong{color:var(--dorado);}
-  .footer-info{margin-top:12px;line-height:1.8;}
+/* TOAST */
+.toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%) translateY(16px);
+  background:var(--d);color:#000;padding:13px 24px;border-radius:50px;font-weight:700;
+  opacity:0;transition:.35s;z-index:9999;pointer-events:none;font-size:.88rem;max-width:88%;text-align:center;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
 
-  /* ====== WHATSAPP FLOTANTE ====== */
-  .wa-flotante{
-    position:fixed;
-    bottom:22px;right:22px;
-    width:60px;height:60px;
-    background:var(--whatsapp);
-    border-radius:50%;
-    display:flex;align-items:center;justify-content:center;
-    font-size:1.9rem;
-    box-shadow:0 6px 20px rgba(37,211,102,.5);
-    z-index:200;
-    text-decoration:none;
-    animation:pulso 2s infinite;
-  }
-  @keyframes pulso{
-    0%,100%{transform:scale(1);}
-    50%{transform:scale(1.08);}
-  }
+/* ===== MODO DUEÑO ===== */
+.ot{position:sticky;top:0;z-index:500;
+  background:linear-gradient(90deg,#3a2200,#1c1100);
+  border-bottom:2px solid var(--d);
+  padding:9px 14px;display:none;flex-wrap:wrap;gap:7px;align-items:center;}
+.ot.show{display:flex;}
+.ot-titulo{color:var(--d);font-weight:800;font-size:.88rem;width:100%;margin-bottom:1px;}
+.ot button{padding:8px 15px;border-radius:50px;font-weight:700;cursor:pointer;
+  font-size:.8rem;font-family:inherit;border:none;white-space:nowrap;}
+.ot .ob{background:var(--d);color:#000;}
+.ot .os{background:rgba(212,175,55,.18);color:var(--d);border:1px solid var(--d)!important;}
+.ot .op{background:transparent;color:#ccc;border:1px solid #666!important;}
 
-  /* ====== TOAST ====== */
-  .toast{
-    position:fixed;
-    bottom:100px;left:50%;
-    transform:translateX(-50%) translateY(20px);
-    background:var(--dorado);
-    color:#000;
-    padding:14px 26px;
-    border-radius:50px;
-    font-weight:700;
-    opacity:0;
-    transition:.4s;
-    z-index:300;
-    pointer-events:none;
-    font-size:.9rem;
-    max-width:90%;
-    text-align:center;
-  }
-  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+/* Pin editar */
+.pin{position:absolute;top:7px;right:7px;width:32px;height:32px;border-radius:50%;
+  background:var(--d);color:#000;border:none;cursor:pointer;font-size:.9rem;
+  display:none;align-items:center;justify-content:center;z-index:10;
+  box-shadow:0 2px 8px rgba(0,0,0,.55);}
+body.md .pin{display:flex;}
+.qr-box .pin{top:5px;right:5px;width:28px;height:28px;font-size:.8rem;}
 
-  /* ====== MODO DUEÑO ====== */
-  .logo{cursor:pointer;user-select:none;}
-  .modal-overlay{
-    position:fixed;inset:0;z-index:500;
-    background:rgba(0,0,0,.75);
-    display:none;
-    align-items:center;justify-content:center;
-    padding:20px;
-  }
-  .modal-overlay.show{display:flex;}
-  .modal-box{
-    background:var(--gris);
-    border:1px solid rgba(212,175,55,.4);
-    border-radius:16px;
-    padding:26px;
-    max-width:380px;width:100%;
-    text-align:center;
-  }
-  .modal-box h3{color:var(--dorado);margin-bottom:14px;font-size:1.1rem;}
-  .modal-box input{
-    width:100%;background:#111;border:1px solid rgba(212,175,55,.4);
-    color:var(--texto);padding:12px 14px;border-radius:10px;
-    font-size:1.1rem;text-align:center;letter-spacing:3px;margin-bottom:14px;
-  }
-  .modal-box .fila-btn{display:flex;gap:10px;}
-  .modal-box .fila-btn button{flex:1;}
-  .btn-cancelar{
-    background:transparent;border:1px solid #555;color:#ccc;
-    padding:11px;border-radius:50px;cursor:pointer;font-weight:600;
-    font-family:inherit;font-size:.9rem;
-  }
-  .owner-toolbar{
-    position:sticky;top:0;z-index:150;
-    background:linear-gradient(90deg,#3a2e00,#1a1400);
-    border-bottom:1px solid var(--dorado);
-    padding:10px 16px;
-    display:none;
-    align-items:center;justify-content:center;
-    gap:10px;flex-wrap:wrap;
-    font-size:.85rem;
-  }
-  .owner-toolbar.show{display:flex;}
-  .owner-toolbar span{color:var(--dorado);font-weight:700;}
-  .owner-toolbar button{
-    background:var(--dorado);color:#000;border:none;
-    padding:8px 16px;border-radius:50px;font-weight:700;
-    cursor:pointer;font-size:.8rem;font-family:inherit;
-  }
-  .owner-toolbar button.salir{background:transparent;border:1px solid #888;color:#ddd;}
-  .edit-pin{
-    position:absolute;top:8px;right:8px;
-    width:32px;height:32px;border-radius:50%;
-    background:rgba(212,175,55,.95);color:#000;
-    display:none;align-items:center;justify-content:center;
-    font-size:1rem;cursor:pointer;border:none;z-index:5;
-  }
-  body.modo-dueno .edit-pin{display:flex;}
-  .card{position:relative;}
-  .editor-negocio{display:none;}
-  body.modo-dueno .editor-negocio{display:block;}
+/* Modales */
+.mo{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.82);
+  display:none;align-items:center;justify-content:center;padding:16px;}
+.mo.show{display:flex;}
+.mb{background:var(--g1);border:1px solid rgba(212,175,55,.45);border-radius:16px;
+  padding:26px 22px;max-width:350px;width:100%;text-align:center;}
+.mb h3{color:var(--d);margin-bottom:5px;font-size:1.05rem;}
+.mb p{color:#aaa;font-size:.8rem;margin-bottom:14px;}
+.mb input[type=password]{width:100%;background:#111;border:1px solid rgba(212,175,55,.4);
+  color:var(--tx);padding:12px;border-radius:9px;font-size:1.3rem;text-align:center;
+  letter-spacing:5px;margin-bottom:14px;font-family:inherit;}
+.mfila{display:flex;gap:9px;}
+.mfila button{flex:1;}
+.bc{background:transparent;border:1px solid #555;color:#ccc;padding:11px;border-radius:50px;
+  cursor:pointer;font-weight:600;font-family:inherit;font-size:.88rem;}
+
+/* Modal ajustes grande */
+.maj{max-width:460px;text-align:left;max-height:86vh;overflow-y:auto;}
+.maj h3{text-align:center;}
+.maj p{text-align:center;}
+.asec{background:rgba(212,175,55,.05);border:1px dashed rgba(212,175,55,.35);
+  border-radius:11px;padding:14px;margin:12px 0;}
+.asec h4{color:var(--d);font-size:.87rem;margin-bottom:11px;}
+.afila{display:flex;align-items:center;gap:9px;margin-bottom:9px;flex-wrap:wrap;}
+.afila label{font-size:.82rem;color:#ccc;min-width:120px;flex:1;}
+.afila input[type=text],.afila input[type=number]{
+  flex:1;min-width:110px;background:#111;border:1px solid rgba(212,175,55,.38);
+  color:var(--d);font-weight:600;padding:8px 11px;border-radius:8px;font-size:.88rem;font-family:inherit;}
+.afila input:focus{outline:2px solid var(--d);}
+
+/* Bloque edición corte */
+.cbloque{background:rgba(255,255,255,.04);border:1px solid rgba(212,175,55,.18);
+  border-radius:9px;padding:11px;margin-bottom:10px;}
+.cbloque .ct{color:var(--d);font-size:.78rem;font-weight:700;margin-bottom:7px;}
+.cbloque .cl{font-size:.76rem;color:#999;display:block;margin-bottom:3px;}
+.cbloque input{width:100%;background:#111;border:1px solid rgba(212,175,55,.32);
+  color:var(--d);font-weight:600;padding:7px 10px;border-radius:7px;font-size:.85rem;
+  margin-bottom:7px;font-family:inherit;}
+.cbloque input:last-child{margin-bottom:0;}
+.cbloque input:focus{outline:2px solid var(--d);}
+
+.bfoto{background:rgba(212,175,55,.14);color:var(--d);border:1px solid var(--d);
+  padding:8px 15px;border-radius:50px;cursor:pointer;font-size:.8rem;font-family:inherit;font-weight:700;}
+.bfoto:hover{background:var(--d);color:#000;}
+.mini{width:56px;height:56px;object-fit:cover;border-radius:7px;border:2px solid var(--d);display:none;}
+.bguar{background:var(--d);color:#000;border:none;padding:12px;border-radius:50px;
+  font-weight:700;cursor:pointer;font-size:.9rem;font-family:inherit;width:100%;margin-top:4px;}
+.bguar:hover{opacity:.88;}
 </style>
 </head>
-<body class="modo-dueno">
+<body id="artifacts-component-root-html" class="">
 
-<!-- FONDO ANIMADO -->
-<div class="fondo-animado"></div>
+<div class="fondo"></div>
 <div class="poste"></div>
-<div class="flotantes">
-  <span>✂️</span><span>💈</span><span>🪒</span><span>💈</span><span>✂️</span>
-</div>
+<div class="floats"><span>✂️</span><span>💈</span><span>🪒</span><span>💈</span><span>✂️</span></div>
 
 <!-- TOOLBAR MODO DUEÑO -->
-<div class="owner-toolbar show" id="ownerToolbar">
-  <span>🔓 Modo Dueño activo</span>
-  <button onclick="copiarCodigoHTML()">📋 Copiar código HTML</button>
-  <button onclick="salirModoDueno()" class="salir">🚪 Salir</button>
+<div class="ot" id="ot">
+  <div class="ot-titulo">🔓 Modo Dueño · Style Modern</div>
+  <button class="ob" onclick="abrirAjustes()">⚙️ Ajustes</button>
+  <button class="ob" onclick="copiarHTML()">📋 Copiar código HTML</button>
+  <button class="os" onclick="descargarHTML()">⬇️ Descargar HTML</button>
+  <button class="op" onclick="salir()">🚪 Salir</button>
 </div>
 
 <!-- MODAL CLAVE -->
-<div class="modal-overlay" id="modalClave">
-  <div class="modal-box">
-    <h3>🔒 Acceso Modo Dueño</h3>
-    <input type="password" id="inputClave" placeholder="Clave de acceso" inputmode="numeric" maxlength="12">
-    <div class="fila-btn">
-      <button class="btn-cancelar" onclick="cerrarModalClave()">Cancelar</button>
-      <button class="guardar" style="flex:1;" onclick="verificarClave()">Ingresar</button>
+<div class="mo" id="moClave">
+  <div class="mb">
+    <h3>🔒 Modo Dueño</h3>
+    <p>Ingresa tu clave de acceso</p>
+    <input type="password" id="iClave" placeholder="••••••••" inputmode="numeric" maxlength="12">
+    <div class="mfila">
+      <button class="bc" onclick="cerrarClave()">Cancelar</button>
+      <button class="bguar" style="flex:1;" onclick="verificar()">Ingresar</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL AJUSTES -->
+<div class="mo" id="moAj">
+  <div class="mb maj">
+    <h3>⚙️ Ajustes</h3>
+    <p style="color:#aaa;font-size:.8rem;margin-bottom:2px;">Modifica y pulsa Guardar</p>
+
+    <div class="asec">
+      <h4>📋 Datos del negocio</h4>
+      <div class="afila"><label>WhatsApp (51...)</label><input type="text" id="cWa"></div>
+      <div class="afila"><label>Número Yape</label><input type="text" id="cYp"></div>
+      <div class="afila"><label>Dirección</label><input type="text" id="cDi"></div>
+      <div class="afila"><label>Horario</label><input type="text" id="cHo"></div>
+    </div>
+
+    <div class="asec">
+      <h4>💜 Foto QR de Yape</h4>
+      <div class="afila">
+        <img id="minYp" class="mini" style="display: none;">
+        <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
+          <button class="bfoto" onclick="elegirFoto('yape')">📷 Subir foto Yape</button>
+          <button class="bfoto" id="btnQYp" style="display:none;" onclick="quitarYape()">🗑️ Quitar foto</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="asec">
+      <h4>📍 Foto QR de Ubicación</h4>
+      <div class="afila">
+        <img id="minLo" class="mini" style="display: none;">
+        <div style="display:flex;flex-direction:column;gap:7px;flex:1;">
+          <button class="bfoto" onclick="elegirFoto('local')">📷 Subir foto Ubicación</button>
+          <button class="bfoto" id="btnQLo" style="display:none;" onclick="quitarLocal()">🗑️ Quitar foto</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="asec">
+      <h4>✂️ Cortes (nombre, descripción y precio)</h4>
+      <div id="ajCortes"><div class="cbloque"><div class="ct">✂️ Corte #1</div><label class="cl">Nombre</label><input type="text" id="an1" value="Fade Clásico"><label class="cl">Descripción</label><input type="text" id="ad1" value="Degradado limpio y moderno, ideal para todo estilo."><label class="cl">Precio (S/)</label><input type="number" id="ap1" min="1" step="1" value="15"></div><div class="cbloque"><div class="ct">✂️ Corte #2</div><label class="cl">Nombre</label><input type="text" id="an2" value="Corte Texturizado"><label class="cl">Descripción</label><input type="text" id="ad2" value="Textura en la parte superior, muy juvenil y actual."><label class="cl">Precio (S/)</label><input type="number" id="ap2" min="1" step="1" value="18"></div><div class="cbloque"><div class="ct">✂️ Corte #3</div><label class="cl">Nombre</label><input type="text" id="an3" value="Mullet Moderno"><label class="cl">Descripción</label><input type="text" id="ad3" value="Estilo retro-vanguardia, tendencia entre jóvenes."><label class="cl">Precio (S/)</label><input type="number" id="ap3" min="1" step="1" value="20"></div><div class="cbloque"><div class="ct">✂️ Corte #4</div><label class="cl">Nombre</label><input type="text" id="an4" value="Buzz Cut / Rapado"><label class="cl">Descripción</label><input type="text" id="ad4" value="Corte al ras, rápido y de bajo mantenimiento."><label class="cl">Precio (S/)</label><input type="number" id="ap4" min="1" step="1" value="12"></div><div class="cbloque"><div class="ct">✂️ Corte #5</div><label class="cl">Nombre</label><input type="text" id="an5" value="Pompadour Clásico"><label class="cl">Descripción</label><input type="text" id="ad5" value="Elegancia para adultos, ideal para oficina."><label class="cl">Precio (S/)</label><input type="number" id="ap5" min="1" step="1" value="22"></div><div class="cbloque"><div class="ct">✂️ Corte #6</div><label class="cl">Nombre</label><input type="text" id="an6" value="Corte con Diseño"><label class="cl">Descripción</label><input type="text" id="ad6" value="Líneas y diseños personalizados, tu estilo único."><label class="cl">Precio (S/)</label><input type="number" id="ap6" min="1" step="1" value="25"></div><div class="cbloque"><div class="ct">✂️ Corte #7</div><label class="cl">Nombre</label><input type="text" id="an7" value="Barba + Corte"><label class="cl">Descripción</label><input type="text" id="ad7" value="Servicio completo: corte moderno + perfilado de barba."><label class="cl">Precio (S/)</label><input type="number" id="ap7" min="1" step="1" value="28"></div><div class="cbloque"><div class="ct">✂️ Corte #8</div><label class="cl">Nombre</label><input type="text" id="an8" value="Corte Niños"><label class="cl">Descripción</label><input type="text" id="ad8" value="Paciencia y estilo para los más pequeños."><label class="cl">Precio (S/)</label><input type="number" id="ap8" min="1" step="1" value="12"></div></div>
+    </div>
+
+    <div style="display:flex;gap:9px;margin-top:6px;">
+      <button class="bc" style="flex:1;" onclick="cerrarAj()">Cancelar</button>
+      <button class="bguar" style="flex:2;" onclick="guardarAj()">💾 Guardar cambios</button>
     </div>
   </div>
 </div>
 
 <!-- HEADER -->
 <header>
-  <div class="logo" id="logoToques" onclick="registrarToqueLogo()">
-    <span class="icono">💈</span>
-    STYLE <span>MODERN</span>
+  <div class="logo" id="logo">
+    <em>💈</em> STYLE <b>MODERN</b>
   </div>
   <nav>
     <a href="#cortes">Cortes</a>
     <a href="#reservar">Reservar</a>
-    <a href="#qr">Ubicación</a>
-    <a href="#contacto">Contacto</a>
+    <a href="#ubic">Ubicación</a>
+    <a href="#pie">Contacto</a>
   </nav>
 </header>
 
 <!-- HERO -->
 <div class="hero">
-  <h1>Estilo que <span>marca</span> diferencia</h1>
+  <h1>Estilo que <b>marca</b> diferencia</h1>
   <p>Los mejores cortes actuales para jóvenes y adultos en San Juan de Lurigancho. Precios accesibles, atención personalizada y pago con Yape.</p>
   <a href="#reservar" class="btn">Reservar Cita</a>
-  <a href="#cortes" class="btn btn-outline">Ver Cortes</a>
+  <a href="#cortes" class="btn btn-o">Ver Cortes</a>
 </div>
 
-<!-- CATÁLOGO DE CORTES -->
+<!-- CORTES -->
 <section id="cortes">
-  <h2 class="titulo-seccion">Nuestros <span>Cortes</span></h2>
-  <p class="subtitulo">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
-
-  <div class="grid-cortes" id="gridCortes">
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(1)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&amp;q=80" alt="Fade Clásico" loading="lazy">
-      <div class="card-body">
-        <h3>Fade Clásico</h3>
-        <p class="desc">Degradado limpio y moderno, ideal para todo estilo.</p>
-        <div class="precio">30.00</div>
-        <button class="btn" onclick="reservarCorte(1)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(2)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&amp;q=80" alt="Corte Texturizado" loading="lazy">
-      <div class="card-body">
-        <h3>Corte Texturizado</h3>
-        <p class="desc">Textura en la parte superior, muy juvenil y actual.</p>
-        <div class="precio">50.00</div>
-        <button class="btn" onclick="reservarCorte(2)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(3)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&amp;q=80" alt="Mullet Moderno" loading="lazy">
-      <div class="card-body">
-        <h3>Mullet Moderno</h3>
-        <p class="desc">Estilo retro-vanguardia, tendencia entre jóvenes.</p>
-        <div class="precio">62.00</div>
-        <button class="btn" onclick="reservarCorte(3)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(4)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&amp;q=80" alt="Buzz Cut / Rapado" loading="lazy">
-      <div class="card-body">
-        <h3>Buzz Cut / Rapado</h3>
-        <p class="desc">Corte al ras, rápido y de bajo mantenimiento.</p>
-        <div class="precio">13.00</div>
-        <button class="btn" onclick="reservarCorte(4)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(5)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&amp;q=80" alt="Pompadour Clásico" loading="lazy">
-      <div class="card-body">
-        <h3>Pompadour Clásico</h3>
-        <p class="desc">Elegancia para adultos, ideal para oficina.</p>
-        <div class="precio">29.00</div>
-        <button class="btn" onclick="reservarCorte(5)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(6)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Corte con Diseño" loading="lazy">
-      <div class="card-body">
-        <h3>Corte con Diseño</h3>
-        <p class="desc">Líneas y diseños personalizados, tu estilo único.</p>
-        <div class="precio">232.00</div>
-        <button class="btn" onclick="reservarCorte(6)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(7)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&amp;q=80" alt="Barba + Corte" loading="lazy">
-      <div class="card-body">
-        <h3>Barba + Corte</h3>
-        <p class="desc">Servicio completo: corte moderno + perfilado de barba.</p>
-        <div class="precio">2812.00</div>
-        <button class="btn" onclick="reservarCorte(7)">Reservar este corte</button>
-      </div>
-    </div>
-  
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(8)">✏️</button>
-      <img src="https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&amp;q=80" alt="Corte Niños" loading="lazy">
-      <div class="card-body">
-        <h3>Corte Niños</h3>
-        <p class="desc">Paciencia y estilo para los más pequeños.</p>
-        <div class="precio">1212.00</div>
-        <button class="btn" onclick="reservarCorte(8)">Reservar este corte</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- EDITOR DE PRECIOS -->
-  <div class="editor">
-    <h3>⚙️ Panel de administración · Modificar precios</h3>
-    <p>Cambia los precios y presiona "Guardar cambios". Se actualizan al instante y quedan guardados en tu navegador.</p>
-    <div id="editorFilas">
-    <div class="editor-fila">
-      <label>Fade Clásico</label>
-      <input type="number" min="1" step="1" id="precio-1" value="30">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Corte Texturizado</label>
-      <input type="number" min="1" step="1" id="precio-2" value="50">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Mullet Moderno</label>
-      <input type="number" min="1" step="1" id="precio-3" value="62">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Buzz Cut / Rapado</label>
-      <input type="number" min="1" step="1" id="precio-4" value="13">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Pompadour Clásico</label>
-      <input type="number" min="1" step="1" id="precio-5" value="29">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Corte con Diseño</label>
-      <input type="number" min="1" step="1" id="precio-6" value="232">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Barba + Corte</label>
-      <input type="number" min="1" step="1" id="precio-7" value="2812">
-    </div>
-  
-    <div class="editor-fila">
-      <label>Corte Niños</label>
-      <input type="number" min="1" step="1" id="precio-8" value="1212">
-    </div>
-  </div>
-    <button class="guardar" onclick="guardarPrecios()">💾 Guardar cambios</button>
-  </div>
-
-  <!-- EDITOR DE DATOS DEL NEGOCIO (SOLO MODO DUEÑO) -->
-  <div class="editor editor-negocio">
-    <h3>🏪 Datos del negocio</h3>
-    <p>Edita la dirección, WhatsApp, Yape y horario. Los QR y textos se actualizan solos.</p>
-    <div class="editor-fila"><label>Número WhatsApp (51...)</label><input type="text" id="cfgWhatsapp"></div>
-    <div class="editor-fila"><label>Número Yape</label><input type="text" id="cfgYape"></div>
-    <div class="editor-fila"><label>Dirección del local</label><input type="text" id="cfgDireccion" style="width:220px;"></div>
-    <div class="editor-fila"><label>Horario de atención</label><input type="text" id="cfgHorario" style="width:220px;"></div>
-    <button class="guardar" onclick="guardarDatosNegocio()">💾 Guardar datos del negocio</button>
-  </div>
+  <h2 class="sec-t">Nuestros <b>Cortes</b></h2>
+  <p class="sec-s">Precios accesibles · Estilo moderno · Para jóvenes y adultos</p>
+  <div class="grid" id="gridCortes"><div class="card"><button class="pin" onclick="elegirFoto('corte',1)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Fade Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Fade Clásico</h3><p class="desc">Degradado limpio y moderno, ideal para todo estilo.</p><div class="precio">15.00</div><button class="btn" onclick="reservarCorte(1)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',2)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Corte Texturizado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte Texturizado</h3><p class="desc">Textura en la parte superior, muy juvenil y actual.</p><div class="precio">18.00</div><button class="btn" onclick="reservarCorte(2)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',3)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Mullet Moderno" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Mullet Moderno</h3><p class="desc">Estilo retro-vanguardia, tendencia entre jóvenes.</p><div class="precio">20.00</div><button class="btn" onclick="reservarCorte(3)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',4)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Buzz Cut / Rapado" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Buzz Cut / Rapado</h3><p class="desc">Corte al ras, rápido y de bajo mantenimiento.</p><div class="precio">12.00</div><button class="btn" onclick="reservarCorte(4)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',5)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Pompadour Clásico" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Pompadour Clásico</h3><p class="desc">Elegancia para adultos, ideal para oficina.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(5)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',6)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Corte con Diseño" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte con Diseño</h3><p class="desc">Líneas y diseños personalizados, tu estilo único.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(6)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',7)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Barba + Corte" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Barba + Corte</h3><p class="desc">Servicio completo: corte moderno + perfilado de barba.</p><div class="precio">29.00</div><button class="btn" onclick="reservarCorte(7)">Reservar este corte</button></div></div><div class="card"><button class="pin" onclick="elegirFoto('corte',8)">✏️</button><img src="https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80" alt="Corte Niños" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&amp;q=80'"><div class="card-body"><h3>Corte Niños</h3><p class="desc">Paciencia y estilo para los más pequeños.</p><div class="precio">80.00</div><button class="btn" onclick="reservarCorte(8)">Reservar este corte</button></div></div></div>
 </section>
 
-<!-- RESERVA DE CITA -->
+<!-- RESERVA -->
 <section id="reservar">
-  <h2 class="titulo-seccion">Reserva tu <span>Cita</span></h2>
-  <p class="subtitulo">Completa tus datos y envía tu reserva directo al WhatsApp del local</p>
-
-  <div class="reserva-box">
-    <div class="form-group">
-      <label>Nombre completo</label>
-      <input type="text" id="cliente" placeholder="Ej: Juan Pérez">
-    </div>
-
-    <div class="form-group">
-      <label>Servicio / Corte</label>
-      <select id="servicio" onchange="actualizarTotal()"><option value="">-- Selecciona un corte --</option><option value="1">Fade Clásico — S/ 30.00</option><option value="2">Corte Texturizado — S/ 50.00</option><option value="3">Mullet Moderno — S/ 62.00</option><option value="4">Buzz Cut / Rapado — S/ 13.00</option><option value="5">Pompadour Clásico — S/ 29.00</option><option value="6">Corte con Diseño — S/ 232.00</option><option value="7">Barba + Corte — S/ 2812.00</option><option value="8">Corte Niños — S/ 1212.00</option></select>
-    </div>
-
-    <div class="form-grid">
-      <div class="form-group">
-        <label>Fecha</label>
-        <input type="date" id="fecha" min="2026-11-08">
-      </div>
-      <div class="form-group">
+  <h2 class="sec-t">Reserva tu <b>Cita</b></h2>
+  <p class="sec-s">Completa tus datos y envía tu reserva por WhatsApp</p>
+  <div class="res-box">
+    <div class="fg"><label>Nombre completo</label><input type="text" id="iCliente" placeholder="Ej: Juan Pérez"></div>
+    <div class="fg"><label>Servicio / Corte</label><select id="iServicio" onchange="calcTotal()"><option value="">-- Selecciona un corte --</option><option value="1">Fade Clásico — S/ 15.00</option><option value="2">Corte Texturizado — S/ 18.00</option><option value="3">Mullet Moderno — S/ 20.00</option><option value="4">Buzz Cut / Rapado — S/ 12.00</option><option value="5">Pompadour Clásico — S/ 80.00</option><option value="6">Corte con Diseño — S/ 80.00</option><option value="7">Barba + Corte — S/ 29.00</option><option value="8">Corte Niños — S/ 80.00</option></select></div>
+    <div class="fg2">
+      <div class="fg"><label>Fecha</label><input type="date" id="iFecha" min="2026-11-08"></div>
+      <div class="fg">
         <label>Hora</label>
-        <select id="hora">
+        <select id="iHora">
           <option value="">-- Selecciona --</option>
           <option>09:00</option><option>10:00</option><option>11:00</option>
           <option>12:00</option><option>13:00</option><option>14:00</option>
@@ -678,525 +858,443 @@
         </select>
       </div>
     </div>
-
-    <div class="form-group">
-      <label>Nota adicional (opcional)</label>
-      <input type="text" id="nota" placeholder="Ej: Corte con degradado bajo">
-    </div>
-
-    <div class="total-box">
-      <span>Total a pagar:</span>
-      <span id="total">S/ 0.00</span>
-    </div>
-
-    <div class="form-group">
+    <div class="fg"><label>Nota (opcional)</label><input type="text" id="iNota" placeholder="Ej: degradado bajo"></div>
+    <div class="total"><span>Total a pagar:</span><span id="iTotal">S/ 0.00</span></div>
+    <div class="fg">
       <label>Método de pago</label>
-      <div class="metodos-pago">
-        <div class="metodo activo" id="btnYape" onclick="seleccionarPago('yape')">💜 Yape</div>
-        <div class="metodo efectivo" id="btnEfectivo" onclick="seleccionarPago('efectivo')">💵 Efectivo</div>
+      <div class="pagos">
+        <div class="pago activo" id="pYape" onclick="setPago('yape')">💜 Yape</div>
+        <div class="pago efect" id="pEfect" onclick="setPago('efect')">💵 Efectivo</div>
       </div>
     </div>
-
-    <div id="panelYape" style="text-align:center;margin-top:18px;">
+    <div id="panelYape" style="text-align:center;margin-top:16px;">
       <div class="qr-box">
-        <button class="edit-pin" title="Cambiar foto de Yape" onclick="editarImagenYape()">✏️</button>
-        <img id="imgYape" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=YAPE-STYLE-MODERN-999888777" alt="QR Yape">
-        <div class="qr-info">Escanea con tu app Yape · <strong>Style Modern</strong></div>
+        <button class="pin" onclick="elegirFoto('yape')">✏️</button>
+        <img id="imgYape" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=YAPE-STYLEMODERN-999888777" alt="QR Yape">
+        <div class="qr-info">Escanea con Yape · <b>Style Modern</b></div>
       </div>
-      <p style="font-size:.8rem;color:#aaa;margin-top:8px;">
-        Yape al: <strong style="color:var(--dorado)" id="txtYapeNumero">999 888 777</strong> · Titular: Style Modern
+      <p style="font-size:.78rem;color:#aaa;margin-top:7px;">
+        Yape al: <b style="color:var(--d)" id="tYape">999 888 777</b> · Titular: Style Modern
       </p>
     </div>
-
-    <button class="btn" style="width:100%;margin-top:22px;" onclick="enviarWhatsApp()">
-      📲 Enviar reserva por WhatsApp
-    </button>
+    <button class="btn" style="width:100%;margin-top:20px;" onclick="enviarWA()">📲 Enviar reserva por WhatsApp</button>
   </div>
 </section>
 
-<!-- QR DEL LOCAL / UBICACIÓN -->
-<section id="qr">
-  <h2 class="titulo-seccion">Nuestra <span>Ubicación</span></h2>
-  <p class="subtitulo">Escanea el QR para ubicar el local en SJL, Lima</p>
-  <div style="text-align:center;">
+<!-- UBICACIÓN -->
+<section id="ubic">
+  <h2 class="sec-t">Nuestra <b>Ubicación</b></h2>
+  <p class="sec-s">Escanea el QR o ven a visitarnos</p>
+  <div class="qr-wrap">
     <div class="qr-box">
-      <button class="edit-pin" title="Cambiar foto de ubicación" onclick="editarImagenLocal()">✏️</button>
-      <img id="imgLocal" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https://maps.google.com/?q=Av.%20Principal%20SJL%2C%20Lima%20San%20Juan%20de%20Lurigancho%20%C2%B7%20Lima%2C%20Per%C3%BA" alt="QR Ubicación Local">
+      <button class="pin" onclick="elegirFoto('local')">✏️</button>
+      <img id="imgLocal" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https%3A%2F%2Fmaps.google.com%2F%3Fq%3DAv.%20Principal%20SJL%2C%20Lima%20San%20Juan%20de%20Lurigancho%20%C2%B7%20Lima%2C%20Per%C3%BA" alt="QR Ubicación">
       <div class="qr-info">Style Modern · San Juan de Lurigancho</div>
     </div>
-    <p style="color:#aaa;font-size:.9rem;margin-top:14px;">
-      📍 <span id="txtDireccion">Av. Principal SJL, Lima</span> · 🕐 <span id="txtHorario">Lun a Dom: 9:00 am - 8:00 pm</span>
+    <p style="color:#aaa;font-size:.88rem;margin-top:12px;">
+      📍 <span id="tDir">Av. Principal SJL, Lima</span> &nbsp;·&nbsp; 🕐 <span id="tHor">Lun a Dom: 9:00 am - 8:00 pm</span>
     </p>
   </div>
 </section>
 
 <!-- FOOTER -->
-<footer id="contacto">
-  <div style="font-size:1.5rem;margin-bottom:10px;">💈 <strong>STYLE MODERN</strong> 💈</div>
-  <div class="footer-info">
-    📍 <span id="footerDireccion">San Juan de Lurigancho · Lima, Perú</span><br>
-    📞 WhatsApp: <strong id="footerWhatsapp">+51999888777</strong><br>
-    🕐 <span id="footerHorario">Lunes a Domingo · 9:00 am - 8:00 pm</span><br>
+<footer id="pie">
+  <div style="font-size:1.4rem;margin-bottom:9px;">💈 <b>STYLE MODERN</b> 💈</div>
+  <div class="foot-info">
+    📍 <span id="tDirF">San Juan de Lurigancho · Lima, Perú</span><br>
+    📞 WhatsApp: <b id="tWaF">+51999888777</b><br>
+    🕐 <span id="tHorF">Lun a Dom: 9:00 am - 8:00 pm</span><br>
     💳 Aceptamos Yape · Efectivo
   </div>
-  <p style="margin-top:20px;color:#555;font-size:.75rem;">
-    © 2025 Style Modern Barbería · Todos los derechos reservados
-  </p>
+  <p style="margin-top:18px;color:#555;font-size:.73rem;">© 2025 Style Modern Barbería · Todos los derechos reservados</p>
 </footer>
 
-<!-- WHATSAPP FLOTANTE -->
-<a class="wa-flotante" id="waFlotante" href="https://wa.me/51999888777?text=Hola%2C%20quiero%20informaci%C3%B3n%20sobre%20los%20cortes%20%F0%9F%92%88" target="_blank" title="Escríbenos">💬</a>
+<a class="wa" id="linkWA" href="https://wa.me/51999888777?text=Hola%2C%20quiero%20informaci%C3%B3n%20sobre%20los%20cortes%20%F0%9F%92%88" target="_blank">💬</a>
+<div class="toast show" id="toast">🔒 Modo Dueño desactivado</div>
+<input type="file" id="fileFoto" accept="image/*" style="display:none;">
 
-<!-- TOAST -->
-<div class="toast" id="toast">✅ Precios actualizados correctamente</div>
-
-<!-- INPUT OCULTO PARA SUBIR FOTOS DESDE EL DISPOSITIVO -->
-<input type="file" id="inputFotoOculto" accept="image/*" style="display:none;">
-
-<!-- DATOS DEL SITIO (se actualizan solos al guardar cambios en Modo Dueño) -->
-<script type="application/json" id="siteData">{"config":{"whatsappDueno":"51999888777","nombreNegocio":"Style Modern","yapeNumero":"999 888 777","direccion":"Av. Principal SJL, Lima","horario":"Lun a Dom: 9:00 am - 8:00 pm","horarioFooter":"Lunes a Domingo · 9:00 am - 8:00 pm","ubicacionTexto":"San Juan de Lurigancho · Lima, Perú","yapeQRImg":null,"localQRImg":null},"cortes":[{"id":1,"nombre":"Fade Clásico","desc":"Degradado limpio y moderno, ideal para todo estilo.","precio":30,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"nombre":"Corte Texturizado","desc":"Textura en la parte superior, muy juvenil y actual.","precio":50,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"nombre":"Mullet Moderno","desc":"Estilo retro-vanguardia, tendencia entre jóvenes.","precio":62,"img":"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80"},{"id":4,"nombre":"Buzz Cut / Rapado","desc":"Corte al ras, rápido y de bajo mantenimiento.","precio":13,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"nombre":"Pompadour Clásico","desc":"Elegancia para adultos, ideal para oficina.","precio":29,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"nombre":"Corte con Diseño","desc":"Líneas y diseños personalizados, tu estilo único.","precio":232,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":7,"nombre":"Barba + Corte","desc":"Servicio completo: corte moderno + perfilado de barba.","precio":2812,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"nombre":"Corte Niños","desc":"Paciencia y estilo para los más pequeños.","precio":1212,"img":"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80"}]}</script>
+<!-- DATOS DEL SITIO (se actualizan al guardar en Modo Dueño) -->
+<script type="application/json" id="SD">{"cfg":{"wa":"51999888777","neg":"Style Modern","yp":"999 888 777","dir":"Av. Principal SJL, Lima","hor":"Lun a Dom: 9:00 am - 8:00 pm","horF":"Lun a Dom: 9:00 am - 8:00 pm","ubic":"San Juan de Lurigancho · Lima, Perú","imgYp":null,"imgLo":null},"lista":[{"id":1,"n":"Fade Clásico","d":"Degradado limpio y moderno, ideal para todo estilo.","p":15,"img":"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},{"id":2,"n":"Corte Texturizado","d":"Textura en la parte superior, muy juvenil y actual.","p":18,"img":"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},{"id":3,"n":"Mullet Moderno","d":"Estilo retro-vanguardia, tendencia entre jóvenes.","p":20,"img":"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},{"id":4,"n":"Buzz Cut / Rapado","d":"Corte al ras, rápido y de bajo mantenimiento.","p":12,"img":"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},{"id":5,"n":"Pompadour Clásico","d":"Elegancia para adultos, ideal para oficina.","p":80,"img":"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},{"id":6,"n":"Corte con Diseño","d":"Líneas y diseños personalizados, tu estilo único.","p":80,"img":"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},{"id":7,"n":"Barba + Corte","d":"Servicio completo: corte moderno + perfilado de barba.","p":29,"img":"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},{"id":8,"n":"Corte Niños","d":"Paciencia y estilo para los más pequeños.","p":80,"img":"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}]}</script>
 
 <script>
-/* ==========================================================
-   DATOS DEL SITIO (embebidos en JSON para poder exportarlos
-   tal cual al copiar el código HTML actualizado)
-   ========================================================== */
-const DATA_DEFAULT = {
-  config: {
-    whatsappDueno: "51999888777",
-    nombreNegocio: "Style Modern",
-    yapeNumero: "999 888 777",
-    direccion: "Av. Principal SJL, Lima",
-    horario: "Lun a Dom: 9:00 am - 8:00 pm",
-    horarioFooter: "Lunes a Domingo · 9:00 am - 8:00 pm",
-    ubicacionTexto: "San Juan de Lurigancho · Lima, Perú",
-    yapeQRImg: null,
-    localQRImg: null
-  },
-  cortes: [
-    { id:1, nombre:"Fade Clásico", desc:"Degradado limpio y moderno, ideal para todo estilo.", precio:15,
-      img:"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80" },
-    { id:2, nombre:"Corte Texturizado", desc:"Textura en la parte superior, muy juvenil y actual.", precio:18,
-      img:"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80" },
-    { id:3, nombre:"Mullet Moderno", desc:"Estilo retro-vanguardia, tendencia entre jóvenes.", precio:20,
-      img:"https://images.unsplash.com/photo-1748354517025-8fc227fcf1be?w=500&q=80" },
-    { id:4, nombre:"Buzz Cut / Rapado", desc:"Corte al ras, rápido y de bajo mantenimiento.", precio:12,
-      img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80" },
-    { id:5, nombre:"Pompadour Clásico", desc:"Elegancia para adultos, ideal para oficina.", precio:22,
-      img:"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80" },
-    { id:6, nombre:"Corte con Diseño", desc:"Líneas y diseños personalizados, tu estilo único.", precio:25,
-      img:"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80" },
-    { id:7, nombre:"Barba + Corte", desc:"Servicio completo: corte moderno + perfilado de barba.", precio:28,
-      img:"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80" },
-    { id:8, nombre:"Corte Niños", desc:"Paciencia y estilo para los más pequeños.", precio:12,
-      img:"https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=500&q=80" }
-  ]
-};
-
-/* El JSON embebido en el <script id="siteData"> es la fuente de
-   verdad que viaja DENTRO del archivo cuando copias el código,
-   así tu web ya sale actualizada en GitHub Pages. */
-const elData = document.getElementById("siteData");
-let siteData;
-try{
-  siteData = JSON.parse(elData.textContent);
-}catch(e){
-  siteData = JSON.parse(JSON.stringify(DATA_DEFAULT));
+/* ── CARGA DE DATOS ── */
+var SD = document.getElementById("SD");
+var D;
+try { D = JSON.parse(SD.textContent); } catch(e) { D = null; }
+// Validar estructura mínima
+if(!D || !D.cfg || !Array.isArray(D.lista) || D.lista.length === 0){
+  D = {
+    cfg:{wa:"51999888777",neg:"Style Modern",yp:"999 888 777",
+         dir:"Av. Principal SJL, Lima",hor:"Lun a Dom: 9:00 am - 8:00 pm",
+         horF:"Lunes a Domingo · 9:00 am - 8:00 pm",
+         ubic:"San Juan de Lurigancho · Lima, Perú",imgYp:null,imgLo:null},
+    lista:[
+      {id:1,n:"Fade Clásico",d:"Degradado limpio y moderno.",p:15,img:"https://images.unsplash.com/photo-1634480257305-7f4ca3582e6a?w=500&q=80"},
+      {id:2,n:"Corte Texturizado",d:"Textura juvenil y actual.",p:18,img:"https://images.unsplash.com/photo-1599351431202-1e0f0137899a?w=500&q=80"},
+      {id:3,n:"Mullet Moderno",d:"Retro-vanguardia, tendencia joven.",p:20,img:"https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80"},
+      {id:4,n:"Buzz Cut / Rapado",d:"Al ras, rápido y bajo mantenimiento.",p:12,img:"https://images.unsplash.com/photo-1580618672591-eb180b1a973f?w=500&q=80"},
+      {id:5,n:"Pompadour Clásico",d:"Elegancia para adultos.",p:22,img:"https://images.unsplash.com/photo-1521490683712-35a1cb235d1c?w=500&q=80"},
+      {id:6,n:"Corte con Diseño",d:"Líneas y diseños únicos.",p:25,img:"https://images.unsplash.com/photo-1622287162716-f311baa1a2b8?w=500&q=80"},
+      {id:7,n:"Barba + Corte",d:"Corte moderno + perfilado de barba.",p:28,img:"https://images.unsplash.com/photo-1621607512214-68297480165e?w=500&q=80"},
+      {id:8,n:"Corte Niños",d:"Paciencia y estilo para los más pequeños.",p:12,img:"https://images.unsplash.com/photo-1521498542256-5aeb47ba2b36?w=500&q=80"}
+    ]
+  };
 }
 
-/* Si hay cambios guardados en este navegador (modo dueño sin
-   copiar el código todavía), se aplican encima */
-const guardadoLocal = JSON.parse(localStorage.getItem("styleModernData") || "null");
-if(guardadoLocal){ siteData = guardadoLocal; }
+/* Estado */
+var isOwner = false;
+var toques = 0, timerT = null;
+var fotoTarget = null;
+var pagoActual = "yape";
 
-let cortes = siteData.cortes;
-let CONFIG = siteData.config;
-let metodoPago = "yape";
-let ownerMode = false;
-let toquesLogo = 0;
-let toquesTimer = null;
-
-const CLAVE_DUENO = "29101991";
-
-function persistirSiteData(){
-  siteData.cortes = cortes;
-  siteData.config = CONFIG;
-  elData.textContent = JSON.stringify(siteData);
-  localStorage.setItem("styleModernData", JSON.stringify(siteData));
+/* ── GUARDAR ── */
+function guardar(){
+  SD.textContent = JSON.stringify(D);
+  try { localStorage.setItem("SM2", JSON.stringify(D)); } catch(e){}
 }
 
-/* ==========================================================
-   RENDERIZADO DE CORTES
-   ========================================================== */
+/* ── RENDER CORTES ── */
 function renderCortes(){
-  const grid = document.getElementById("gridCortes");
-  grid.innerHTML = cortes.map(c => `
-    <div class="card">
-      <button class="edit-pin" title="Cambiar foto" onclick="editarImagenCorte(${c.id})">✏️</button>
-      <img src="${c.img}" alt="${c.nombre}" loading="lazy">
-      <div class="card-body">
-        <h3>${c.nombre}</h3>
-        <p class="desc">${c.desc}</p>
-        <div class="precio">${c.precio.toFixed(2)}</div>
-        <button class="btn" onclick="reservarCorte(${c.id})">Reservar este corte</button>
-      </div>
-    </div>
-  `).join("");
+  var html = "";
+  for(var i=0;i<D.lista.length;i++){
+    var c = D.lista[i];
+    var precio = Number(c.p).toFixed(2);
+    html += '<div class="card">';
+    html += '<button class="pin" onclick="elegirFoto(\'corte\','+c.id+')">✏️</button>';
+    html += '<img src="'+c.img+'" alt="'+c.n+'" loading="lazy" onerror="this.src=\'https://images.unsplash.com/photo-1503951914875-452162b0f3f1?w=500&q=80\'">';
+    html += '<div class="card-body">';
+    html += '<h3>'+c.n+'</h3>';
+    html += '<p class="desc">'+c.d+'</p>';
+    html += '<div class="precio">'+precio+'</div>';
+    html += '<button class="btn" onclick="reservarCorte('+c.id+')">Reservar este corte</button>';
+    html += '</div></div>';
+  }
+  document.getElementById("gridCortes").innerHTML = html;
 }
 
-function editarImagenCorte(id){
-  if(!ownerMode) return;
-  abrirSelectorFoto({tipo:"corte", id});
-}
-
-/* ==========================================================
-   SELECT DE SERVICIO EN FORMULARIO
-   ========================================================== */
+/* ── RENDER SELECT ── */
 function renderSelect(){
-  const sel = document.getElementById("servicio");
-  sel.innerHTML = '<option value="">-- Selecciona un corte --</option>' +
-    cortes.map(c => `<option value="${c.id}">${c.nombre} — S/ ${c.precio.toFixed(2)}</option>`).join("");
+  var html = '<option value="">-- Selecciona un corte --</option>';
+  for(var i=0;i<D.lista.length;i++){
+    var c = D.lista[i];
+    html += '<option value="'+c.id+'">'+c.n+' — S/ '+Number(c.p).toFixed(2)+'</option>';
+  }
+  document.getElementById("iServicio").innerHTML = html;
 }
 
-/* ==========================================================
-   EDITOR DE PRECIOS
-   ========================================================== */
-function renderEditor(){
-  const cont = document.getElementById("editorFilas");
-  cont.innerHTML = cortes.map(c => `
-    <div class="editor-fila">
-      <label>${c.nombre}</label>
-      <input type="number" min="1" step="1" id="precio-${c.id}" value="${c.precio}">
-    </div>
-  `).join("");
+/* ── TEXTOS Y QRs ── */
+function aplicarTextos(){
+  document.getElementById("tDir").textContent  = D.cfg.dir;
+  document.getElementById("tHor").textContent  = D.cfg.hor;
+  document.getElementById("tDirF").textContent = D.cfg.ubic;
+  document.getElementById("tWaF").textContent  = "+"+D.cfg.wa;
+  document.getElementById("tHorF").textContent = D.cfg.horF;
+  document.getElementById("tYape").textContent = D.cfg.yp;
 }
 
-function guardarPrecios(){
-  cortes = cortes.map(c => {
-    const input = document.getElementById("precio-" + c.id);
-    const nuevo = parseFloat(input.value);
-    return { ...c, precio: isNaN(nuevo) || nuevo <= 0 ? c.precio : nuevo };
-  });
-  persistirSiteData();
+function aplicarQRs(){
+  var qrBase = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=";
+  document.getElementById("imgYape").src  = D.cfg.imgYp || (qrBase+encodeURIComponent("YAPE-STYLEMODERN-"+D.cfg.yp.replace(/\s/g,"")));
+  document.getElementById("imgLocal").src = D.cfg.imgLo || (qrBase+encodeURIComponent("https://maps.google.com/?q="+D.cfg.dir+" "+D.cfg.ubic));
+  document.getElementById("linkWA").href  = "https://wa.me/"+D.cfg.wa+"?text="+encodeURIComponent("Hola, quiero información sobre los cortes 💈");
+}
+
+/* ── 3 TOQUES EN LOGO ── */
+document.getElementById("logo").addEventListener("click", function(){
+  if(isOwner) return;
+  toques++;
+  clearTimeout(timerT);
+  timerT = setTimeout(function(){ toques=0; }, 1200);
+  if(toques >= 3){ toques=0; abrirClave(); }
+});
+
+/* ── CLAVE ── */
+function abrirClave(){
+  document.getElementById("iClave").value = "";
+  document.getElementById("moClave").classList.add("show");
+  setTimeout(function(){ document.getElementById("iClave").focus(); }, 150);
+}
+function cerrarClave(){ document.getElementById("moClave").classList.remove("show"); }
+
+document.getElementById("iClave").addEventListener("keydown", function(e){
+  if(e.key==="Enter") verificar();
+});
+
+function verificar(){
+  var v = document.getElementById("iClave").value.trim();
+  if(v === "29101991"){
+    cerrarClave();
+    activar();
+  } else {
+    toast("❌ Clave incorrecta");
+    document.getElementById("iClave").value="";
+  }
+}
+
+/* ── ACTIVAR / SALIR MODO DUEÑO ── */
+function activar(){
+  isOwner = true;
+  document.body.classList.add("md");
+  document.getElementById("ot").classList.add("show");
+  renderCortes();
+  toast("🔓 Modo Dueño activado");
+}
+
+function salir(){
+  isOwner = false;
+  document.body.classList.remove("md");
+  document.getElementById("ot").classList.remove("show");
+  cerrarAj();
+  renderCortes();
+  toast("🔒 Modo Dueño desactivado");
+}
+
+/* ── AJUSTES ── */
+function abrirAjustes(){
+  document.getElementById("cWa").value = D.cfg.wa;
+  document.getElementById("cYp").value = D.cfg.yp;
+  document.getElementById("cDi").value = D.cfg.dir;
+  document.getElementById("cHo").value = D.cfg.hor;
+
+  var minYp = document.getElementById("minYp");
+  var minLo = document.getElementById("minLo");
+  var bQYp  = document.getElementById("btnQYp");
+  var bQLo  = document.getElementById("btnQLo");
+
+  if(D.cfg.imgYp){ minYp.src=D.cfg.imgYp; minYp.style.display="block"; bQYp.style.display="block"; }
+  else { minYp.style.display="none"; bQYp.style.display="none"; }
+  if(D.cfg.imgLo){ minLo.src=D.cfg.imgLo; minLo.style.display="block"; bQLo.style.display="block"; }
+  else { minLo.style.display="none"; bQLo.style.display="none"; }
+
+  var html = "";
+  for(var i=0;i<D.lista.length;i++){
+    var c = D.lista[i];
+    html += '<div class="cbloque">';
+    html += '<div class="ct">✂️ Corte #'+(i+1)+'</div>';
+    html += '<label class="cl">Nombre</label>';
+    html += '<input type="text" id="an'+c.id+'" value="'+escHtml(c.n)+'">';
+    html += '<label class="cl">Descripción</label>';
+    html += '<input type="text" id="ad'+c.id+'" value="'+escHtml(c.d)+'">';
+    html += '<label class="cl">Precio (S/)</label>';
+    html += '<input type="number" id="ap'+c.id+'" min="1" step="1" value="'+c.p+'">';
+    html += '</div>';
+  }
+  document.getElementById("ajCortes").innerHTML = html;
+  document.getElementById("moAj").classList.add("show");
+}
+
+function escHtml(s){
+  return String(s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function cerrarAj(){ document.getElementById("moAj").classList.remove("show"); }
+
+function guardarAj(){
+  var wa = document.getElementById("cWa").value.trim();
+  var yp = document.getElementById("cYp").value.trim();
+  var di = document.getElementById("cDi").value.trim();
+  var ho = document.getElementById("cHo").value.trim();
+  if(wa) D.cfg.wa  = wa;
+  if(yp) D.cfg.yp  = yp;
+  if(di) D.cfg.dir = di;
+  if(ho){ D.cfg.hor = ho; D.cfg.horF = ho; }
+
+  for(var i=0;i<D.lista.length;i++){
+    var c  = D.lista[i];
+    var eN = document.getElementById("an"+c.id);
+    var eD = document.getElementById("ad"+c.id);
+    var eP = document.getElementById("ap"+c.id);
+    if(eN && eN.value.trim()) c.n = eN.value.trim();
+    if(eD && eD.value.trim()) c.d = eD.value.trim();
+    if(eP){ var v=parseFloat(eP.value); if(!isNaN(v)&&v>0) c.p=v; }
+  }
+
+  guardar();
   renderCortes();
   renderSelect();
-  renderEditor();
-  actualizarTotal();
-  mostrarToast("✅ Precios actualizados correctamente");
+  aplicarTextos();
+  aplicarQRs();
+  cerrarAj();
+  toast("✅ Cambios guardados");
 }
 
-/* ==========================================================
-   MODO DUEÑO — activación por 3 toques en el logo + clave
-   ========================================================== */
-function registrarToqueLogo(){
-  if(ownerMode) return;
-  toquesLogo++;
-  clearTimeout(toquesTimer);
-  toquesTimer = setTimeout(() => { toquesLogo = 0; }, 1200);
-  if(toquesLogo >= 3){
-    toquesLogo = 0;
-    abrirModalClave();
-  }
+function quitarYape(){
+  D.cfg.imgYp = null;
+  document.getElementById("minYp").style.display="none";
+  document.getElementById("btnQYp").style.display="none";
+  guardar(); aplicarQRs();
+  toast("✅ Volviendo al QR automático de Yape");
+}
+function quitarLocal(){
+  D.cfg.imgLo = null;
+  document.getElementById("minLo").style.display="none";
+  document.getElementById("btnQLo").style.display="none";
+  guardar(); aplicarQRs();
+  toast("✅ Volviendo al QR automático de Ubicación");
 }
 
-function abrirModalClave(){
-  const modal = document.getElementById("modalClave");
-  const input = document.getElementById("inputClave");
-  input.value = "";
-  modal.classList.add("show");
-  setTimeout(() => input.focus(), 100);
+/* ── FOTOS ── */
+function elegirFoto(tipo, id){
+  if(!isOwner) return;
+  fotoTarget = {tipo:tipo, id:id||null};
+  var f = document.getElementById("fileFoto");
+  f.value=""; f.click();
 }
 
-function cerrarModalClave(){
-  document.getElementById("modalClave").classList.remove("show");
-}
-
-function verificarClave(){
-  const valor = document.getElementById("inputClave").value.trim();
-  if(valor === CLAVE_DUENO){
-    cerrarModalClave();
-    activarModoDueno();
-  } else {
-    mostrarToast("❌ Clave incorrecta");
-  }
-}
-
-function activarModoDueno(){
-  ownerMode = true;
-  document.body.classList.add("modo-dueno");
-  document.getElementById("ownerToolbar").classList.add("show");
-  renderCortes();
-  cargarDatosNegocioEnEditor();
-  mostrarToast("🔓 Modo Dueño activado");
-}
-
-function salirModoDueno(){
-  ownerMode = false;
-  document.body.classList.remove("modo-dueno");
-  document.getElementById("ownerToolbar").classList.remove("show");
-  renderCortes();
-  mostrarToast("🔒 Modo Dueño desactivado");
-}
-
-function cargarDatosNegocioEnEditor(){
-  document.getElementById("cfgWhatsapp").value = CONFIG.whatsappDueno;
-  document.getElementById("cfgYape").value = CONFIG.yapeNumero;
-  document.getElementById("cfgDireccion").value = CONFIG.direccion;
-  document.getElementById("cfgHorario").value = CONFIG.horario;
-}
-
-function guardarDatosNegocio(){
-  CONFIG.whatsappDueno = document.getElementById("cfgWhatsapp").value.trim() || CONFIG.whatsappDueno;
-  CONFIG.yapeNumero = document.getElementById("cfgYape").value.trim() || CONFIG.yapeNumero;
-  CONFIG.direccion = document.getElementById("cfgDireccion").value.trim() || CONFIG.direccion;
-  CONFIG.horario = document.getElementById("cfgHorario").value.trim() || CONFIG.horario;
-  CONFIG.horarioFooter = CONFIG.horario;
-  persistirSiteData();
-  aplicarTextosNegocio();
-  regenerarQRs();
-  mostrarToast("✅ Datos del negocio actualizados");
-}
-
-function aplicarTextosNegocio(){
-  document.getElementById("txtDireccion").textContent = CONFIG.direccion;
-  document.getElementById("txtHorario").textContent = CONFIG.horario;
-  document.getElementById("footerDireccion").textContent = CONFIG.ubicacionTexto;
-  document.getElementById("footerWhatsapp").textContent = "+" + CONFIG.whatsappDueno;
-  document.getElementById("footerHorario").textContent = CONFIG.horarioFooter;
-  document.getElementById("txtYapeNumero").textContent = CONFIG.yapeNumero;
-}
-
-function regenerarQRs(){
-  if(CONFIG.yapeQRImg){
-    document.getElementById("imgYape").src = CONFIG.yapeQRImg;
-  } else {
-    const dataYape = "YAPE-" + CONFIG.nombreNegocio.toUpperCase().replace(/\s+/g,"-") + "-" + CONFIG.yapeNumero.replace(/\s+/g,"");
-    document.getElementById("imgYape").src = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + encodeURIComponent(dataYape);
-  }
-  if(CONFIG.localQRImg){
-    document.getElementById("imgLocal").src = CONFIG.localQRImg;
-  } else {
-    const dataLocal = "https://maps.google.com/?q=" + encodeURIComponent(CONFIG.direccion + " " + CONFIG.ubicacionTexto);
-    document.getElementById("imgLocal").src = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + dataLocal;
-  }
-  document.getElementById("waFlotante").href =
-    `https://wa.me/${CONFIG.whatsappDueno}?text=${encodeURIComponent("Hola, quiero información sobre los cortes 💈")}`;
-}
-
-function editarImagenYape(){
-  if(!ownerMode) return;
-  if(CONFIG.yapeQRImg && confirm("Ya tienes una foto de Yape personalizada.\n\nAceptar = subir otra foto nueva\nCancelar = volver al QR automático")){
-    abrirSelectorFoto({tipo:"yape"});
-  } else if(CONFIG.yapeQRImg){
-    CONFIG.yapeQRImg = null;
-    persistirSiteData();
-    regenerarQRs();
-    mostrarToast("✅ Volviendo al QR automático de Yape");
-  } else {
-    abrirSelectorFoto({tipo:"yape"});
-  }
-}
-
-function editarImagenLocal(){
-  if(!ownerMode) return;
-  if(CONFIG.localQRImg && confirm("Ya tienes una foto de ubicación personalizada.\n\nAceptar = subir otra foto nueva\nCancelar = volver al QR automático")){
-    abrirSelectorFoto({tipo:"local"});
-  } else if(CONFIG.localQRImg){
-    CONFIG.localQRImg = null;
-    persistirSiteData();
-    regenerarQRs();
-    mostrarToast("✅ Volviendo al QR automático de ubicación");
-  } else {
-    abrirSelectorFoto({tipo:"local"});
-  }
-}
-
-/* ==========================================================
-   SUBIR FOTOS DESDE EL DISPOSITIVO (galería/cámara)
-   ========================================================== */
-let objetivoFoto = null;
-
-function abrirSelectorFoto(objetivo){
-  objetivoFoto = objetivo;
-  const input = document.getElementById("inputFotoOculto");
-  input.value = "";
-  input.click();
-}
-
-document.getElementById("inputFotoOculto").addEventListener("change", function(e){
-  const file = e.target.files && e.target.files[0];
-  if(!file || !objetivoFoto) return;
-  if(!file.type.startsWith("image/")){
-    mostrarToast("⚠️ Elige un archivo de imagen");
-    return;
-  }
-  mostrarToast("⏳ Procesando foto...");
-  const maxAncho = objetivoFoto.tipo === "corte" ? 700 : 450;
-  redimensionarImagen(file, maxAncho, (dataUrl) => {
-    if(objetivoFoto.tipo === "corte"){
-      const corte = cortes.find(c => c.id === objetivoFoto.id);
-      if(corte){ corte.img = dataUrl; renderCortes(); }
-    } else if(objetivoFoto.tipo === "yape"){
-      CONFIG.yapeQRImg = dataUrl;
-      regenerarQRs();
-    } else if(objetivoFoto.tipo === "local"){
-      CONFIG.localQRImg = dataUrl;
-      regenerarQRs();
+document.getElementById("fileFoto").addEventListener("change", function(e){
+  var file = e.target.files && e.target.files[0];
+  if(!file || !fotoTarget) return;
+  if(!file.type.startsWith("image/")){ toast("⚠️ Elige una imagen"); return; }
+  toast("⏳ Procesando...");
+  var maxW = fotoTarget.tipo==="corte" ? 700 : 450;
+  redim(file, maxW, function(url){
+    if(fotoTarget.tipo==="corte"){
+      for(var i=0;i<D.lista.length;i++){
+        if(D.lista[i].id===fotoTarget.id){ D.lista[i].img=url; break; }
+      }
+      renderCortes();
+    } else if(fotoTarget.tipo==="yape"){
+      D.cfg.imgYp = url;
+      document.getElementById("imgYape").src = url;
+      var m=document.getElementById("minYp"); m.src=url; m.style.display="block";
+      document.getElementById("btnQYp").style.display="block";
+    } else if(fotoTarget.tipo==="local"){
+      D.cfg.imgLo = url;
+      document.getElementById("imgLocal").src = url;
+      var m=document.getElementById("minLo"); m.src=url; m.style.display="block";
+      document.getElementById("btnQLo").style.display="block";
     }
-    persistirSiteData();
-    mostrarToast("✅ Foto actualizada");
-    objetivoFoto = null;
+    guardar();
+    toast("✅ Foto actualizada");
+    fotoTarget = null;
   });
 });
 
-function redimensionarImagen(file, maxAncho, callback){
-  const lector = new FileReader();
-  lector.onload = (e) => {
-    const img = new Image();
-    img.onload = () => {
-      let w = img.width, h = img.height;
-      if(w > maxAncho){
-        h = Math.round(h * (maxAncho / w));
-        w = maxAncho;
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-      callback(canvas.toDataURL("image/jpeg", 0.82));
+function redim(file, maxW, cb){
+  var r = new FileReader();
+  r.onload = function(e){
+    var img = new Image();
+    img.onload = function(){
+      var w=img.width, h=img.height;
+      if(w>maxW){ h=Math.round(h*(maxW/w)); w=maxW; }
+      var cv=document.createElement("canvas");
+      cv.width=w; cv.height=h;
+      cv.getContext("2d").drawImage(img,0,0,w,h);
+      cb(cv.toDataURL("image/jpeg",0.82));
     };
-    img.onerror = () => {
-      mostrarToast("⚠️ No se pudo leer esa imagen");
-    };
-    img.src = e.target.result;
+    img.onerror=function(){ toast("⚠️ No se pudo leer la imagen"); };
+    img.src=e.target.result;
   };
-  lector.onerror = () => mostrarToast("⚠️ No se pudo leer el archivo");
-  lector.readAsDataURL(file);
+  r.onerror=function(){ toast("⚠️ Error al leer el archivo"); };
+  r.readAsDataURL(file);
 }
 
-/* ==========================================================
-   COPIAR CÓDIGO HTML ACTUALIZADO (para GitHub Pages)
-   ========================================================== */
-function copiarCodigoHTML(){
-  persistirSiteData();
-  const codigo = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(codigo).then(() => {
-      mostrarToast("📋 Código copiado — pégalo en tu index.html de GitHub");
-    }).catch(() => copiarConTextarea(codigo));
-  } else {
-    copiarConTextarea(codigo);
-  }
+/* ── COPIAR / DESCARGAR HTML ── */
+function htmlLimpio(cb){
+  salir();           // Cierra modo dueño primero
+  setTimeout(function(){
+    cb("<!DOCTYPE html>\n"+document.documentElement.outerHTML);
+  }, 100);
 }
 
-function copiarConTextarea(texto){
-  const ta = document.createElement("textarea");
-  ta.value = texto;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  try{
-    document.execCommand("copy");
-    mostrarToast("📋 Código copiado — pégalo en tu index.html de GitHub");
-  }catch(e){
-    mostrarToast("⚠️ No se pudo copiar automáticamente, selecciona y copia manualmente");
-  }
+function copiarHTML(){
+  htmlLimpio(function(code){
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(code).then(function(){
+        toast("📋 Código copiado — pégalo en GitHub");
+      }).catch(function(){ copiarConTA(code); });
+    } else {
+      copiarConTA(code);
+    }
+  });
+}
+
+function copiarConTA(text){
+  var ta=document.createElement("textarea");
+  ta.value=text; ta.style.cssText="position:fixed;opacity:0;top:0;left:0;";
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand("copy"); toast("📋 Código copiado — pégalo en GitHub"); }
+  catch(e){ toast("⚠️ No se pudo copiar automáticamente"); }
   document.body.removeChild(ta);
 }
 
-/* ==========================================================
-   RESERVA
-   ========================================================== */
+function descargarHTML(){
+  htmlLimpio(function(code){
+    var blob=new Blob([code],{type:"text/html;charset=utf-8"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a");
+    a.href=url; a.download="index.html";
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast("⬇️ Descargando index.html...");
+  });
+}
+
+/* ── RESERVA ── */
 function reservarCorte(id){
-  document.getElementById("servicio").value = id;
-  actualizarTotal();
+  document.getElementById("iServicio").value = id;
+  calcTotal();
   document.getElementById("reservar").scrollIntoView({behavior:"smooth"});
 }
 
-function actualizarTotal(){
-  const id = document.getElementById("servicio").value;
-  const corte = cortes.find(c => c.id == id);
-  const totalEl = document.getElementById("total");
-  totalEl.textContent = corte ? "S/ " + corte.precio.toFixed(2) : "S/ 0.00";
+function calcTotal(){
+  var id = document.getElementById("iServicio").value;
+  var c = null;
+  for(var i=0;i<D.lista.length;i++){ if(String(D.lista[i].id)===String(id)){ c=D.lista[i]; break; } }
+  document.getElementById("iTotal").textContent = c ? "S/ "+Number(c.p).toFixed(2) : "S/ 0.00";
 }
 
-/* Selección de método de pago */
-function seleccionarPago(metodo){
-  metodoPago = metodo;
-  document.getElementById("btnYape").classList.toggle("activo", metodo === "yape");
-  document.getElementById("btnEfectivo").classList.toggle("activo", metodo === "efectivo");
-  document.getElementById("panelYape").style.display = metodo === "yape" ? "block" : "none";
+function setPago(m){
+  pagoActual=m;
+  document.getElementById("pYape").classList.toggle("activo", m==="yape");
+  document.getElementById("pEfect").classList.toggle("activo", m==="efect");
+  document.getElementById("panelYape").style.display = m==="yape"?"block":"none";
 }
 
-/* ==========================================================
-   ENVIAR RESERVA A WHATSAPP
-   ========================================================== */
-function enviarWhatsApp(){
-  const cliente = document.getElementById("cliente").value.trim();
-  const idServ = document.getElementById("servicio").value;
-  const fecha = document.getElementById("fecha").value;
-  const hora = document.getElementById("hora").value;
-  const nota = document.getElementById("nota").value.trim();
-
-  if(!cliente || !idServ || !fecha || !hora){
-    mostrarToast("⚠️ Completa todos los campos obligatorios");
-    return;
-  }
-
-  const corte = cortes.find(c => c.id == idServ);
-  const metodoTexto = metodoPago === "yape" ? "Yape 💜" : "Efectivo 💵";
-
-  const f = new Date(fecha + "T00:00:00");
-  const fechaBonita = f.toLocaleDateString("es-PE", {
-    weekday:"long", day:"numeric", month:"long", year:"numeric"
-  });
-
-  const mensaje =
-`💈 *NUEVA RESERVA - ${CONFIG.nombreNegocio}* 💈
-━━━━━━━━━━━━━━━━━━━━
-👤 *Cliente:* ${cliente}
-✂️ *Servicio:* ${corte.nombre}
-💰 *Precio:* S/ ${corte.precio.toFixed(2)}
-📅 *Fecha:* ${fechaBonita}
-🕐 *Hora:* ${hora}
-💳 *Pago:* ${metodoTexto}
-${nota ? "📝 *Nota:* " + nota : ""}
-━━━━━━━━━━━━━━━━━━━━
-_Reserva enviada desde la web_`;
-
-  const url = `https://wa.me/${CONFIG.whatsappDueno}?text=${encodeURIComponent(mensaje)}`;
-  window.open(url, "_blank");
-  mostrarToast("📲 Abriendo WhatsApp...");
+function enviarWA(){
+  var cli  = document.getElementById("iCliente").value.trim();
+  var id   = document.getElementById("iServicio").value;
+  var fech = document.getElementById("iFecha").value;
+  var hora = document.getElementById("iHora").value;
+  var nota = document.getElementById("iNota").value.trim();
+  if(!cli||!id||!fech||!hora){ toast("⚠️ Completa todos los campos"); return; }
+  var c=null; for(var i=0;i<D.lista.length;i++){ if(String(D.lista[i].id)===String(id)){ c=D.lista[i]; break; } }
+  var pago = pagoActual==="yape"?"Yape 💜":"Efectivo 💵";
+  var f=new Date(fech+"T00:00:00");
+  var fb=f.toLocaleDateString("es-PE",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  var msg="💈 *NUEVA RESERVA - "+D.cfg.neg+"* 💈\n━━━━━━━━━━━━━━━━\n"+
+    "👤 *Cliente:* "+cli+"\n✂️ *Servicio:* "+c.n+"\n💰 *Precio:* S/ "+Number(c.p).toFixed(2)+
+    "\n📅 *Fecha:* "+fb+"\n🕐 *Hora:* "+hora+"\n💳 *Pago:* "+pago+
+    (nota?"\n📝 *Nota:* "+nota:"")+"\n━━━━━━━━━━━━━━━━\n_Reserva enviada desde la web_";
+  window.open("https://wa.me/"+D.cfg.wa+"?text="+encodeURIComponent(msg),"_blank");
+  toast("📲 Abriendo WhatsApp...");
 }
 
-/* ==========================================================
-   TOAST
-   ========================================================== */
-function mostrarToast(msg){
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  setTimeout(() => t.classList.remove("show"), 2800);
+/* ── TOAST ── */
+function toast(msg){
+  var t=document.getElementById("toast");
+  t.textContent=msg; t.classList.add("show");
+  clearTimeout(t._t);
+  t._t=setTimeout(function(){ t.classList.remove("show"); },3000);
 }
 
-/* ==========================================================
-   INICIALIZACIÓN
-   ========================================================== */
-document.addEventListener("DOMContentLoaded", () => {
+/* ── INICIO ── */
+window.addEventListener("DOMContentLoaded", function(){
+  // Limpiar localStorage viejo que podría tener datos corruptos
+  try{
+    var viejo = localStorage.getItem("styleModernData");
+    if(viejo){ localStorage.removeItem("styleModernData"); }
+  }catch(e){}
+
   renderCortes();
   renderSelect();
-  renderEditor();
-  aplicarTextosNegocio();
-  regenerarQRs();
-
-  const hoy = new Date().toISOString().split("T")[0];
-  document.getElementById("fecha").min = hoy;
-
-  actualizarTotal();
+  aplicarTextos();
+  aplicarQRs();
+  document.getElementById("iFecha").min = new Date().toISOString().split("T")[0];
+  calcTotal();
 });
 </script>
-
 
 
 </body></html>
